@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 # ----------------------------
 # ENV / НАСТРОЙКИ
 # ----------------------------
-BOT_TOKEN = os.getenv("8700127990:AAERFsQ1OKOVpOC9nA3Zz1fnnalLRUUz864")
-AITUNNEL_API_KEY = os.getenv("sk-aitunnel-cBbguC18FOui6evysHcjtKDT2aDKWdFc")
-AITUNNEL_BASE_URL = os.getenv("https://api.aitunnel.ru/v1")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+AITUNNEL_API_KEY = os.getenv("AITUNNEL_API_KEY")
+AITUNNEL_BASE_URL = os.getenv("AITUNNEL_BASE_URL", "https://api.aitunnel.ru/v1")
 
 TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1")
