@@ -172,7 +172,7 @@ def add_generations(user_id: int, amount: int) -> int:
 def consume_generation(user_id: int) -> bool:
     db = load_db()
     uid = str(user_id)
-        if uid not in db["users"]:
+    if uid not in db["users"]:
         db["users"][uid] = {
             "paid_generations": 0,
             "daily_text_count": 0,
