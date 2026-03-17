@@ -171,8 +171,7 @@ def add_generations(user_id: int, amount: int) -> int:
 
 def consume_generation(user_id: int) -> bool:
     db = load_db()
-    uid = str(user_id)
-    if uid not in db["users"]:
+    uid = str(user_id)if uid not in db["users"]:
         db["users"][uid] = {
             "paid_generations": 0,
             "daily_text_count": 0,
@@ -327,8 +326,7 @@ def generate_image_blocking(prompt: str) -> bytes:
     )
 
     image_b64 = extract_image_b64(response)
-    if not image_b64:
-            raise RuntimeError("API не вернул изображение")
+    if not image_b64:raise RuntimeError("API не вернул изображение")
 
     return base64.b64decode(image_b64)
 
@@ -455,8 +453,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Неизвестный пакет.")
         return
 
-    logger.info(
-        "Invoice requested: user_id=%s payload=%s price=%s",
+    logger.info("Invoice requested: user_id=%s payload=%s price=%s",
         update.effective_user.id if update.effective_user else "unknown",
         payload,
         price,
@@ -590,8 +587,7 @@ async def handle_text_request(update: Update, user_text: str):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
-        return
-            user_text = update.message.text.strip()
+        returnuser_text = update.message.text.strip()
     if not user_text:
         return
 
