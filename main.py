@@ -759,7 +759,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await send_topup_menu(update, balance)
         return
 
-    if is_image_request(user_text):await handle_image_request(update, user_text)
+    if is_image_request(user_text):
+        await handle_image_request(update, user_text)
         return
 
     await handle_text_request(update, user_text)
