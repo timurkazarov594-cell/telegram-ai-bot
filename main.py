@@ -359,7 +359,8 @@ TOPUP_TEXT_TRIGGERS = [
 
 
 def is_image_request(text: str) -> bool:
-    text = text.lower().strip()return any(trigger in text for trigger in IMAGE_TRIGGERS)
+    text = text.lower().strip()
+    return any(trigger in text for trigger in IMAGE_TRIGGERS)
 
 
 def is_topup_text_request(text: str) -> bool:
