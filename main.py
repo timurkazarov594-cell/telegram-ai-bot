@@ -415,11 +415,7 @@ def save_payment(
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(
-            """
-            INSERT OR IGNORE INTO payments
-            (telegram_payment_charge_id, user_id, payload, total_amount, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
+            "INSERT OR IGNORE INTO payments (telegram_payment_charge_id, user_id, payload, total_amount, created_at) VALUES (?, ?, ?, ?, ?)",
             (
                 telegram_payment_charge_id,
                 user_id,
