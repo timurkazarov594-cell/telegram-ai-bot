@@ -279,11 +279,9 @@ def consume_generation(user_id: int) -> bool:
             return False
 
         cur.execute(
-            """
-            UPDATE users
+            "UPDATE users
             SET paid_generations = paid_generations - 1
-            WHERE user_id = ?
-            """,
+            WHERE user_id = ?"
             (user_id,),
         )
 
