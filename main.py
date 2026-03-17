@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import tempfile
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import httpx
 from openai import OpenAI
@@ -13,6 +13,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     LabeledPrice,
+    BotCommand,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -21,6 +22,7 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     CallbackQueryHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -67,13 +69,13 @@ DB_FILE = "users.json"
 def load_db():
     if not os.path.exists(DB_FILE):
         return {"users": {}}
-    with open(DB_FILE, "r") as f:
+    with open(DB_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def save_db(db):
-    with open(DB_FILE, "w") as f:
-        json.dump(db, f)
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
 
 
 def get_user(user_id):
@@ -81,9 +83,7 @@ def get_user(user_id):
     uid = str(user_id)
 
     if uid not in db["users"]:
-        db["users"][uid] = {
-            "paid": 0,
-        }
+        db["users"][uid] = {"paid": 0}
 
     save_db(db)
     return db["users"][uid]
@@ -91,23 +91,34 @@ def get_user(user_id):
 
 def add_generations(user_id, amount):
     db = load_db()
-    user = get_user(user_id)
-    user["paid"] += amount
-    db["users"][str(user_id)] = user
+    uid = str(user_id)
+
+    if uid not in db["users"]:
+        db["users"][uid] = {"paid": 0}
+
+    db["users"][uid]["paid"] += amount
     save_db(db)
 
 
 def use_generation(user_id):
     db = load_db()
-    user = get_user(user_id)
+    uid = str(user_id)
 
-    if user["paid"] <= 0:
+    if uid not in db["users"]:
+        db["users"][uid] = {"paid": 0}
+
+    if db["users"][uid]["paid"] <= 0:
+        save_db(db)
         return False
 
-    user["paid"] -= 1
-    db["users"][str(user_id)] = user
+    db["users"][uid]["paid"] -= 1
     save_db(db)
     return True
+
+
+def get_balance(user_id) -> int:
+    user = get_user(user_id)
+    return int(user.get("paid", 0))
 
 
 # --------------------------------
@@ -116,8 +127,11 @@ def use_generation(user_id):
 IMAGE_TRIGGERS = [
     "сгенерируй",
     "создай картинку",
+    "создай изображение",
     "нарисуй",
     "generate image",
+    "draw",
+    "create image",
 ]
 
 
@@ -144,11 +158,9 @@ def extract_image(response) -> Optional[str]:
 def gen_text(text):
     r = client.chat.completions.create(
         model=TEXT_MODEL,
-        messages=[
-            {"role": "user", "content": text},
-        ],
+        messages=[{"role": "user", "content": text}],
     )
-    return r.choices[0].message.content
+    return r.choices[0].message.content or "Не удалось получить ответ."
 
 
 def gen_image(prompt):
@@ -159,7 +171,21 @@ def gen_image(prompt):
     )
 
     img = extract_image(r)
+    if not img:
+        raise RuntimeError("Изображение не получено от API")
+
     return base64.b64decode(img)
+
+
+# --------------------------------
+# КОМАНДЫ В МЕНЮ
+# --------------------------------
+async def post_init(application: Application) -> None:
+    await application.bot.set_my_commands([
+        BotCommand("start", "Запуск бота"),BotCommand("popolnit", "Купить генерации"),
+        BotCommand("balance", "Проверить баланс"),
+        BotCommand("help", "Помощь"),
+    ])
 
 
 # --------------------------------
@@ -171,20 +197,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Я умею:\n"
         "- генерировать текст\n"
         "- генерировать изображения\n\n"
-        "⚠️ Для изображений нужна оплата\n"
-        "/popolnit — купить генерации"
+        "Для генерации изображений сначала пополни баланс.\n"
+        "/popolnit — купить генерации\n"
+        "/balance — посмотреть баланс"
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Команды:\n"
+        "/start — запуск\n"
+        "/popolnit — купить генерации\n"
+        "/balance — проверить баланс\n\n"
+        "Для генерации изображения просто напиши:\n"
+        "«Нарисуй город будущего ночью»"
+    )
+
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    balance = get_balance(user_id)
+    await update.message.reply_text(
+        f"На вашем балансе {balance} генераций."
     )
 
 
 async def popolnit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
+        [InlineKeyboardButton("150 ⭐ — 4 генерации", callback_data="buy_4")],
         [InlineKeyboardButton("300 ⭐ — 10 генераций", callback_data="buy_10")],
         [InlineKeyboardButton("800 ⭐ — 25 генераций", callback_data="buy_25")],
     ]
 
     await update.message.reply_text(
         "Привет, у тебя нет генераций.\n\n"
-        "Купи пакет ниже👇",
+        "Купи пакет ниже 👇",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -196,7 +243,11 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "buy_10":
+    if query.data == "buy_4":
+        title = "4 генерации"
+        payload = "buy_4"
+        price = 150
+    elif query.data == "buy_10":
         title = "10 генераций"
         payload = "buy_10"
         price = 300
@@ -210,10 +261,15 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title=title,
         description="Покупка генераций изображений",
         payload=payload,
-        provider_token="",  # ВАЖНО
+        provider_token="",
         currency="XTR",
         prices=[LabeledPrice(title, price)],
     )
+
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
 
 
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -221,30 +277,36 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     payload = payment.invoice_payload
     user_id = update.effective_user.id
 
-    if payload == "buy_10":
-        add_generations(user_id, 10)
-        text = "✅ Начислено 10 генераций"
+    if payload == "buy_4":
+        amount = 4
+    elif payload == "buy_10":
+        amount = 10
     else:
-        add_generations(user_id, 25)
-        text = "✅ Начислено 25 генераций"
+        amount = 25
 
-    await update.message.reply_text(text)
+    add_generations(user_id, amount)
+    balance = get_balance(user_id)
+
+    await update.message.reply_text(
+        f"Платеж успешно получен! На вашем балансе {balance} генераций."
+    )
 
 
 # --------------------------------
-# ОБРАБОТКА
+# ОБРАБОТКА СООБЩЕНИЙ
 # --------------------------------
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
     text = update.message.text
     user_id = update.effective_user.id
 
     if is_image(text):
-        user = get_user(user_id)
-
-        if user["paid"] <= 0:
+        if get_balance(user_id) <= 0:
             await update.message.reply_text(
-                "❌ У тебя нет генераций\n"
-                "/popolnit — купить"
+                "❌ У тебя нет генераций.\n"
+                "Используй /popolnit"
             )
             return
 
@@ -252,45 +314,48 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             img = await asyncio.to_thread(gen_image, text)
-
             use_generation(user_id)
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as f:
                 f.write(img)
                 path = f.name
 
-            await update.message.reply_photo(photo=open(path, "rb"))
+            with open(path, "rb") as photo:
+                await update.message.reply_photo(photo=photo)
+
             os.remove(path)
 
         except Exception as e:
-            logger.exception(e)
-            await update.message.reply_text("Ошибка генерации")
-
+            logger.exception("Image generation error: %s", e)
+            await update.message.reply_text("Ошибка генерации изображения.")
     else:
         await send_typing(update)
 
         try:
             ans = await asyncio.to_thread(gen_text, text)
             await update.message.reply_text(ans)
-        except Exception:
-            await update.message.reply_text("Ошибка")
+        except Exception as e:
+            logger.exception("Text generation error: %s", e)
+            await update.message.reply_text("Ошибка генерации текста.")
 
 
 # --------------------------------
 # MAIN
 # --------------------------------
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("balance", balance_command))
     app.add_handler(CommandHandler("popolnit", popolnit))
 
     app.add_handler(CallbackQueryHandler(buy_callback))
-
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
