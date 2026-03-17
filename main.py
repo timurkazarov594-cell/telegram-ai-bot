@@ -56,14 +56,11 @@ if not AITUNNEL_API_KEY:
 # --------------------------------
 # ЛИМИТЫ
 # --------------------------------
-# Сколько текстовых сообщений в день может отправить пользователь
 DAILY_TEXT_LIMIT = 20
-
-# Московское время (UTC+3)
 MSK = timezone(timedelta(hours=3))
 
 # --------------------------------
-# CLIENT
+# OPENAI CLIENT
 # --------------------------------
 client = OpenAI(
     api_key=AITUNNEL_API_KEY,
@@ -77,7 +74,7 @@ client = OpenAI(
 DB_FILE = "users.json"
 
 
-def load_db():
+def load_db() -> dict:
     if not os.path.exists(DB_FILE):
         return {"users": {}}
 
@@ -89,7 +86,7 @@ def load_db():
         return {"users": {}}
 
 
-def save_db(db):
+def save_db(db: dict) -> None:
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
 
@@ -98,7 +95,7 @@ def today_msk_str() -> str:
     return datetime.now(MSK).strftime("%Y-%m-%d")
 
 
-def ensure_user(user_id: int):
+def ensure_user(user_id: int) -> dict:
     db = load_db()
     uid = str(user_id)
 
@@ -113,7 +110,7 @@ def ensure_user(user_id: int):
     return db["users"][uid]
 
 
-def reset_daily_if_needed(user_id: int):
+def reset_daily_if_needed(user_id: int) -> dict:
     db = load_db()
     uid = str(user_id)
 
@@ -171,14 +168,16 @@ def add_generations(user_id: int, amount: int) -> int:
 
 def consume_generation(user_id: int) -> bool:
     db = load_db()
-    uid = str(user_id)if uid not in db["users"]:
-        db["users"][uid] = {
-            "paid_generations": 0,
+    uid = str(user_id)
+
+    if uid not in db["users"]:
+        db["users"][uid] = {"paid_generations": 0,
             "daily_text_count": 0,
             "last_reset": today_msk_str(),
         }
 
     current = int(db["users"][uid].get("paid_generations", 0))
+
     if current <= 0:
         save_db(db)
         return False
@@ -210,7 +209,6 @@ def increment_text_count(user_id: int) -> int:
             "last_reset": today_msk_str(),
         }
 
-    # Перед увеличением проверяем, не наступил ли новый день по МСК
     today = today_msk_str()
     if db["users"][uid].get("last_reset") != today:
         db["users"][uid]["daily_text_count"] = 0
@@ -222,7 +220,7 @@ def increment_text_count(user_id: int) -> int:
 
 
 # --------------------------------
-# УТИЛИТЫ
+# ТРИГГЕРЫ
 # --------------------------------
 IMAGE_TRIGGERS = [
     "сгенерируй",
@@ -256,7 +254,7 @@ def is_topup_text_request(text: str) -> bool:
     return text in TOPUP_TEXT_TRIGGERS
 
 
-async def send_typing(update: Update, action=ChatAction.TYPING):
+async def send_typing(update: Update, action: str = ChatAction.TYPING) -> None:
     if update.effective_chat:
         await update.effective_chat.send_action(action=action)
 
@@ -279,12 +277,12 @@ def extract_image_b64(response) -> Optional[str]:
                     if image_base64:
                         return image_base64
         except Exception:
-            logger.exception("Ошибка при разборе ответа изображения")
+            logger.exception("Ошибка при разборе изображения из API")
 
     return None
 
 
-def build_buy_keyboard():
+def build_buy_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("150 ⭐ — 4 генерации", callback_data="buy_4")],
@@ -303,10 +301,7 @@ def generate_text_blocking(user_text: str) -> str:
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "Ты полезный Telegram-бот. "
-                    "Отвечай кратко, ясно и по делу."
-                ),
+                "content": "Ты полезный Telegram-бот. Отвечай кратко, ясно и по делу.",
             },
             {"role": "user", "content": user_text},
         ],
@@ -326,14 +321,14 @@ def generate_image_blocking(prompt: str) -> bytes:
     )
 
     image_b64 = extract_image_b64(response)
-    if not image_b64:raise RuntimeError("API не вернул изображение")
+    if not image_b64:
+        raise RuntimeError("API не вернул изображение")
 
     return base64.b64decode(image_b64)
 
 
 # --------------------------------
-# КОМАНДЫ В МЕНЮ
-# --------------------------------
+# КОМАНДЫ В МЕНЮ# --------------------------------
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
         [
@@ -364,7 +359,7 @@ async def send_topup_menu(update: Update, balance: int) -> None:
 # --------------------------------
 # КОМАНДЫ
 # --------------------------------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     balance = get_balance(user_id)
     daily_left = get_daily_text_left(user_id)
@@ -386,7 +381,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     balance = get_balance(user_id)
     daily_left = get_daily_text_left(user_id)
@@ -406,14 +401,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     balance = get_balance(update.effective_user.id)
     await update.message.reply_text(
         f"На вашем балансе {balance} генераций."
     )
 
 
-async def limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     daily_left = get_daily_text_left(user_id)
     await update.message.reply_text(
@@ -422,7 +417,7 @@ async def limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def popolnit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def popolnit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     balance = get_balance(update.effective_user.id)
     await send_topup_menu(update, balance)
 
@@ -430,7 +425,7 @@ async def popolnit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------
 # ОПЛАТА
 # --------------------------------
-async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
@@ -453,9 +448,9 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Неизвестный пакет.")
         return
 
-    logger.info("Invoice requested: user_id=%s payload=%s price=%s",
-        update.effective_user.id if update.effective_user else "unknown",
-        payload,
+    logger.info(
+        "Invoice requested: user_id=%s payload=%s price=%s",
+        update.effective_user.id if update.effective_user else "unknown",payload,
         price,
     )
 
@@ -470,7 +465,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.pre_checkout_query
 
     logger.info(
@@ -484,7 +479,7 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer(ok=True)
 
 
-async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     payment = update.message.successful_payment
     user_id = update.effective_user.id
     payload = payment.invoice_payload
@@ -514,7 +509,7 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 # --------------------------------
 # ОБРАБОТКА ЗАПРОСОВ
 # --------------------------------
-async def handle_image_request(update: Update, user_text: str):
+async def handle_image_request(update: Update, user_text: str) -> None:
     user_id = update.effective_user.id
     balance = get_balance(user_id)
 
@@ -555,7 +550,7 @@ async def handle_image_request(update: Update, user_text: str):
         )
 
 
-async def handle_text_request(update: Update, user_text: str):
+async def handle_text_request(update: Update, user_text: str) -> None:
     user_id = update.effective_user.id
 
     if not can_send_text(user_id):
@@ -585,14 +580,15 @@ async def handle_text_request(update: Update, user_text: str):
         await update.message.reply_text("Не удалось получить ответ.")
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
-        returnuser_text = update.message.text.strip()
+        return
+
+    user_text = update.message.text.strip()
     if not user_text:
         return
 
-    logger.info(
-        "Message from user_id=%s text=%s",
+    logger.info("Message from user_id=%s text=%s",
         update.effective_user.id if update.effective_user else "unknown",
         user_text[:200],
     )
@@ -609,14 +605,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_text_request(update, user_text)
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled error: %s", context.error)
 
 
 # --------------------------------
 # MAIN
 # --------------------------------
-def main():
+def main() -> None:
     logger.info("Building Telegram application")
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
