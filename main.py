@@ -69,7 +69,7 @@ MSK = timezone(timedelta(hours=3))
 
 IMAGE_PACKAGES = {
     "buy_4": {"title": "4 генерации", "price": 150, "gens": 4},
-    "buy_15": {"title": "15 генераций", "price": 399, "gens": 15},
+    "buy_10": {"title": "10 генераций", "price": 399, "gens": 10},
     "buy_25": {"title": "25 генераций", "price": 800, "gens": 25},
 }
 
@@ -129,6 +129,7 @@ def init_db() -> None:
             "CREATE TABLE IF NOT EXISTS users ("
             "user_id INTEGER PRIMARY KEY, "
             "paid_generations INTEGER NOT NULL DEFAULT 0, "
+            "free_generations INTEGER NOT NULL DEFAULT 1, "
             "daily_text_count INTEGER NOT NULL DEFAULT 0, "
             "last_reset TEXT NOT NULL)"
         )
@@ -143,6 +144,16 @@ def init_db() -> None:
         )
 
         conn.commit()
+
+        # Миграция старой базы, если колонка free_generations отсутствует
+        try:
+            cur.execute("SELECT free_generations FROM users LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute(
+                "ALTER TABLE users ADD COLUMN free_generations INTEGER NOT NULL DEFAULT 1"
+            )
+            conn.commit()
+
         conn.close()
 
     logger.info("Database initialized at %s", DB_PATH)
@@ -158,11 +169,21 @@ def ensure_user(user_id: int) -> None:
 
         if row is None:
             cur.execute(
-                "INSERT INTO users (user_id, paid_generations, daily_text_count, last_reset) "
-                "VALUES (?, 0, 0, ?)",
+                "INSERT INTO users (user_id, paid_generations, free_generations, daily_text_count, last_reset) "
+                "VALUES (?, 0, 1, 0, ?)",
                 (user_id, today_msk_str()),
             )
             conn.commit()
+        else:
+            # Подстраховка для старых записей
+            try:
+                cur.execute(
+                    "UPDATE users SET free_generations = COALESCE(free_generations, 1) WHERE user_id = ?",
+                    (user_id,),
+                )
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
 
         conn.close()
 
@@ -194,13 +215,43 @@ def get_balance(user_id: int) -> int:
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT paid_generations FROM users WHERE user_id = ?", (user_id,))
+        cur.execute(
+            "SELECT paid_generations, free_generations FROM users WHERE user_id = ?",
+            (user_id,),
+        )
         row = cur.fetchone()
         conn.close()
 
-    balance = int(row["paid_generations"]) if row else 0
-    logger.info("get_balance user_id=%s balance=%s", user_id, balance)
+    paid = int(row["paid_generations"]) if row else 0
+    free = int(row["free_generations"]) if row else 0
+    balance = paid + free
+
+    logger.info(
+        "get_balance user_id=%s paid=%s free=%s total=%s",
+        user_id,
+        paid,
+        free,
+        balance,
+    )
     return balance
+
+
+def get_balance_parts(user_id: int) -> tuple[int, int]:
+    ensure_user(user_id)
+
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT paid_generations, free_generations FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        conn.close()
+
+    paid = int(row["paid_generations"]) if row else 0
+    free = int(row["free_generations"]) if row else 0
+    return paid, free
 
 
 def add_generations(user_id: int, amount: int) -> int:
@@ -216,18 +267,26 @@ def add_generations(user_id: int, amount: int) -> int:
         )
         conn.commit()
 
-        cur.execute("SELECT paid_generations FROM users WHERE user_id = ?", (user_id,))
+        cur.execute(
+            "SELECT paid_generations, free_generations FROM users WHERE user_id = ?",
+            (user_id,),
+        )
         row = cur.fetchone()
         conn.close()
 
-    new_balance = int(row["paid_generations"]) if row else 0
+    paid = int(row["paid_generations"]) if row else 0
+    free = int(row["free_generations"]) if row else 0
+    total = paid + free
+
     logger.info(
-        "add_generations user_id=%s amount=%s new_balance=%s",
+        "add_generations user_id=%s amount=%s paid=%s free=%s total=%s",
         user_id,
         amount,
-        new_balance,
+        paid,
+        free,
+        total,
     )
-    return new_balance
+    return total
 
 
 def consume_generation(user_id: int) -> bool:
@@ -238,25 +297,43 @@ def consume_generation(user_id: int) -> bool:
         cur = conn.cursor()
 
         cur.execute("BEGIN IMMEDIATE")
-        cur.execute("SELECT paid_generations FROM users WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-        current = int(row["paid_generations"]) if row else 0
-
-        logger.info("consume_generation user_id=%s current=%s", user_id, current)
-
-        if current <= 0:
-            conn.rollback()
-            conn.close()
-            return False
-
         cur.execute(
-            "UPDATE users SET paid_generations = paid_generations - 1 WHERE user_id = ?",
+            "SELECT paid_generations, free_generations FROM users WHERE user_id = ?",
             (user_id,),
         )
+        row = cur.fetchone()
 
-        conn.commit()
+        paid = int(row["paid_generations"]) if row else 0
+        free = int(row["free_generations"]) if row else 0
+
+        logger.info(
+            "consume_generation user_id=%s paid=%s free=%s",
+            user_id,
+            paid,
+            free,
+        )
+
+        if free > 0:
+            cur.execute(
+                "UPDATE users SET free_generations = free_generations - 1 WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
+            conn.close()
+            return True
+
+        if paid > 0:
+            cur.execute(
+                "UPDATE users SET paid_generations = paid_generations - 1 WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
+            conn.close()
+            return True
+
+        conn.rollback()
         conn.close()
-        return True
+        return False
 
 
 def get_daily_text_left(user_id: int) -> int:
@@ -380,7 +457,7 @@ def build_buy_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("150 ⭐ — 4 генерации", callback_data="buy_4")],
-            [InlineKeyboardButton("399 ⭐ — 15 генераций", callback_data="buy_15")],
+            [InlineKeyboardButton("399 ⭐ — 10 генераций", callback_data="buy_10")],
             [InlineKeyboardButton("800 ⭐ — 25 генераций", callback_data="buy_25")],
         ]
     )
@@ -466,6 +543,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Я умею:\n"
         "- отвечать на текстовые вопросы\n"
         "- генерировать изображения\n\n"
+        "🎁 У каждого есть 1 бесплатная генерация.\n"
         "После оплаты генерации начисляются на баланс.\n"
         "Списание происходит только после успешной отправки картинки.\n\n"
         f"Сейчас у вас: {balance} генераций.\n"
@@ -491,6 +569,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/balance — показать баланс генераций\n"
         "/limit — показать лимит на сегодня\n"
         "/popolnit — купить генерации\n\n"
+        "🎁 У каждого есть 1 бесплатная генерация.\n"
         f"Сейчас на балансе: {balance} генераций.\n"
         f"Осталось текстовых запросов сегодня: {daily_left}/{DAILY_TEXT_LIMIT}\n\n"
         "Пример для картинки:\n"
@@ -500,8 +579,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    balance = get_balance(update.effective_user.id)
-    await update.message.reply_text(f"На вашем балансе {balance} генераций.")
+    user_id = update.effective_user.id
+    total = get_balance(user_id)
+    paid, free = get_balance_parts(user_id)
+
+    await update.message.reply_text(
+        f"На вашем балансе {total} генераций.\n"
+        f"Платных: {paid}\n"
+        f"Бесплатных: {free}"
+    )
 
 
 async def limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -607,7 +693,11 @@ async def handle_image_request(update: Update, user_text: str) -> None:
     ensure_user(user_id)
 
     balance_before = get_balance(user_id)
-    logger.info("handle_image_request user_id=%s balance_before=%s", user_id, balance_before)
+    logger.info(
+        "handle_image_request user_id=%s balance_before=%s",
+        user_id,
+        balance_before,
+    )
 
     if balance_before <= 0:
         await update.message.reply_text(
@@ -635,9 +725,13 @@ async def handle_image_request(update: Update, user_text: str) -> None:
             )
             return
 
-        new_balance = get_balance(user_id)
+        total_after = get_balance(user_id)
+        paid_after, free_after = get_balance_parts(user_id)
+
         await update.message.reply_text(
-            f"Готово. Остаток на балансе: {new_balance} генераций."
+            f"Готово. Остаток на балансе: {total_after} генераций.\n"
+            f"Платных: {paid_after}\n"
+            f"Бесплатных: {free_after}"
         )
 
     except Exception as e:
