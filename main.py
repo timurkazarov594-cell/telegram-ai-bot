@@ -163,7 +163,8 @@ def ensure_user(user_id: int) -> None:
         conn.close()
 
 
-def reset_daily_if_needed(user_id: int) -> None:ensure_user(user_id)
+def reset_daily_if_needed(user_id: int) -> None:
+    ensure_user(user_id)
 
     with db_lock:
         conn = get_conn()
@@ -319,7 +320,8 @@ def save_payment(
         cur = conn.cursor()
 
         cur.execute(
-            "INSERT OR IGNORE INTO payments ""(telegram_payment_charge_id, user_id, payload, total_amount, created_at) "
+            "INSERT OR IGNORE INTO payments "
+            "(telegram_payment_charge_id, user_id, payload, total_amount, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (
                 telegram_payment_charge_id,
@@ -459,7 +461,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     balance = get_balance(user_id)
     daily_left = get_daily_text_left(user_id)
 
-    text = ("Привет!\n\n"
+    text = (
+        "Привет!\n\n"
         "Я умею:\n"
         "- отвечать на текстовые вопросы\n"
         "- генерировать изображения\n\n"
@@ -581,7 +584,8 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
         )
         return
 
-    package = IMAGE_PACKAGES.get(payload)gens_to_add = package["gens"] if package else 0
+    package = IMAGE_PACKAGES.get(payload)
+    gens_to_add = package["gens"] if package else 0
 
     save_payment(charge_id, user_id, payload, payment.total_amount)
 
@@ -712,7 +716,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # --------------------------------
 # MAIN
 # --------------------------------
-def main() -> None:logger.info("Building Telegram application")
+def main() -> None:
+    logger.info("Building Telegram application")
 
     init_db()
 
