@@ -45,7 +45,10 @@ AITUNNEL_API_KEY = os.getenv("AITUNNEL_API_KEY")
 AITUNNEL_BASE_URL = os.getenv("AITUNNEL_BASE_URL", "https://api.aitunnel.ru/v1")
 
 TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1")
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1-mini")
+IMAGE_QUALITY = os.getenv("IMAGE_QUALITY", "low")
+IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")
+
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
 
 # Для Render лучше использовать Persistent Disk:
@@ -66,12 +69,13 @@ MSK = timezone(timedelta(hours=3))
 
 IMAGE_PACKAGES = {
     "buy_4": {"title": "4 генерации", "price": 150, "gens": 4},
-    "buy_10": {"title": "10 генераций", "price": 300, "gens": 10},
+    "buy_15": {"title": "15 генераций", "price": 399, "gens": 15},
     "buy_25": {"title": "25 генераций", "price": 800, "gens": 25},
 }
 
 IMAGE_TRIGGERS = [
     "сгенерируй",
+    "сгенерируй изображение",
     "создай картинку",
     "создай изображение",
     "нарисуй",
@@ -227,11 +231,6 @@ def add_generations(user_id: int, amount: int) -> int:
 
 
 def consume_generation(user_id: int) -> bool:
-    """
-    Списывает 1 генерацию атомарно.
-    Возвращает True, если успешно списано.
-    Возвращает False, если баланс уже 0.
-    """
     ensure_user(user_id)
 
     with db_lock:
@@ -381,7 +380,7 @@ def build_buy_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("150 ⭐ — 4 генерации", callback_data="buy_4")],
-            [InlineKeyboardButton("300 ⭐ — 10 генераций", callback_data="buy_10")],
+            [InlineKeyboardButton("399 ⭐ — 15 генераций", callback_data="buy_15")],
             [InlineKeyboardButton("800 ⭐ — 25 генераций", callback_data="buy_25")],
         ]
     )
@@ -412,7 +411,8 @@ def generate_image_blocking(prompt: str) -> bytes:
     response = client.images.generate(
         model=IMAGE_MODEL,
         prompt=prompt,
-        size="1024x1024",
+        size=IMAGE_SIZE,
+        quality=IMAGE_QUALITY,
     )
 
     image_b64 = extract_image_b64(response)
