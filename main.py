@@ -48,7 +48,7 @@ TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
 
-# На Render лучше использовать Persistent Disk:
+# Для Render лучше использовать Persistent Disk:
 # DB_PATH=/var/data/bot.db
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
@@ -122,26 +122,20 @@ def init_db() -> None:
         cur = conn.cursor()
 
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                paid_generations INTEGER NOT NULL DEFAULT 0,
-                daily_text_count INTEGER NOT NULL DEFAULT 0,
-                last_reset TEXT NOT NULL
-            )
-            """
+            "CREATE TABLE IF NOT EXISTS users ("
+            "user_id INTEGER PRIMARY KEY, "
+            "paid_generations INTEGER NOT NULL DEFAULT 0, "
+            "daily_text_count INTEGER NOT NULL DEFAULT 0, "
+            "last_reset TEXT NOT NULL)"
         )
 
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS payments (
-                telegram_payment_charge_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                payload TEXT NOT NULL,
-                total_amount INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
+            "CREATE TABLE IF NOT EXISTS payments ("
+            "telegram_payment_charge_id TEXT PRIMARY KEY, "
+            "user_id INTEGER NOT NULL, "
+            "payload TEXT NOT NULL, "
+            "total_amount INTEGER NOT NULL, "
+            "created_at TEXT NOT NULL)"
         )
 
         conn.commit()
@@ -160,37 +154,28 @@ def ensure_user(user_id: int) -> None:
 
         if row is None:
             cur.execute(
-                """
-                INSERT INTO users (user_id, paid_generations, daily_text_count, last_reset)
-                VALUES (?, 0, 0, ?)
-                """,(user_id, today_msk_str()),
+                "INSERT INTO users (user_id, paid_generations, daily_text_count, last_reset) "
+                "VALUES (?, 0, 0, ?)",
+                (user_id, today_msk_str()),
             )
             conn.commit()
 
         conn.close()
 
 
-def reset_daily_if_needed(user_id: int) -> None:
-    ensure_user(user_id)
+def reset_daily_if_needed(user_id: int) -> None:ensure_user(user_id)
 
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
 
-        cur.execute(
-            "SELECT last_reset FROM users WHERE user_id = ?",
-            (user_id,),
-        )
+        cur.execute("SELECT last_reset FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
 
         today = today_msk_str()
         if row and row["last_reset"] != today:
             cur.execute(
-                """
-                UPDATE users
-                SET daily_text_count = 0, last_reset = ?
-                WHERE user_id = ?
-                """,
+                "UPDATE users SET daily_text_count = 0, last_reset = ? WHERE user_id = ?",
                 (today, user_id),
             )
             conn.commit()
@@ -204,10 +189,7 @@ def get_balance(user_id: int) -> int:
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            "SELECT paid_generations FROM users WHERE user_id = ?",
-            (user_id,),
-        )
+        cur.execute("SELECT paid_generations FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
         conn.close()
 
@@ -224,19 +206,12 @@ def add_generations(user_id: int, amount: int) -> int:
         cur = conn.cursor()
 
         cur.execute(
-            """
-            UPDATE users
-            SET paid_generations = paid_generations + ?
-            WHERE user_id = ?
-            """,
+            "UPDATE users SET paid_generations = paid_generations + ? WHERE user_id = ?",
             (amount, user_id),
         )
         conn.commit()
 
-        cur.execute(
-            "SELECT paid_generations FROM users WHERE user_id = ?",
-            (user_id,),
-        )
+        cur.execute("SELECT paid_generations FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
         conn.close()
 
@@ -263,11 +238,7 @@ def consume_generation(user_id: int) -> bool:
         cur = conn.cursor()
 
         cur.execute("BEGIN IMMEDIATE")
-
-        cur.execute(
-            "SELECT paid_generations FROM users WHERE user_id = ?",
-            (user_id,),
-        )
+        cur.execute("SELECT paid_generations FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
         current = int(row["paid_generations"]) if row else 0
 
@@ -294,10 +265,7 @@ def get_daily_text_left(user_id: int) -> int:
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            "SELECT daily_text_count FROM users WHERE user_id = ?",
-            (user_id,),
-        )
+        cur.execute("SELECT daily_text_count FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
         conn.close()
 
@@ -315,14 +283,12 @@ def increment_text_count(user_id: int) -> None:
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
+
         cur.execute(
-            """
-            UPDATE users
-            SET daily_text_count = daily_text_count + 1
-            WHERE user_id = ?
-            """,
+            "UPDATE users SET daily_text_count = daily_text_count + 1 WHERE user_id = ?",
             (user_id,),
         )
+
         conn.commit()
         conn.close()
 
@@ -331,72 +297,9 @@ def payment_already_processed(telegram_payment_charge_id: str) -> bool:
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """(user_id, today_msk_str()),
-            )
-            conn.commit()
-
-        conn.close()
-
-
-def reset_daily_if_needed(user_id: int) -> None:
-    ensure_user(user_id)
-
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
 
         cur.execute(
-            "SELECT last_reset FROM users WHERE user_id = ?",
-            (user_id,),
-        )
-        row = cur.fetchone()
-
-        today = today_msk_str()
-        if row and row["last_reset"] != today:
-            cur.execute(
-                """
-                UPDATE users
-                SET daily_text_count = 0, last_reset = ?
-                WHERE user_id = ?
-                """,
-                (today, user_id),
-            )
-            conn.commit()
-
-        conn.close()
-
-
-def get_balance(user_id: int) -> int:
-    ensure_user(user_id)
-
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT paid_generations FROM users WHERE user_id = ?",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-
-    balance = int(row["paid_generations"]) if row else 0
-    logger.info("get_balance user_id=%s balance=%s", user_id, balance)
-    return balance
-
-
-def add_generations(user_id: int, amount: int) -> int:
-    ensure_user(user_id)
-
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute(
-            """SELECT telegram_payment_charge_id
-            FROM payments
-            WHERE telegram_payment_charge_id = ?
-            """,
+            "SELECT telegram_payment_charge_id FROM payments WHERE telegram_payment_charge_id = ?",
             (telegram_payment_charge_id,),
         )
         row = cur.fetchone()
@@ -414,8 +317,10 @@ def save_payment(
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
+
         cur.execute(
-            "INSERT OR IGNORE INTO payments (telegram_payment_charge_id, user_id, payload, total_amount, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO payments ""(telegram_payment_charge_id, user_id, payload, total_amount, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
             (
                 telegram_payment_charge_id,
                 user_id,
@@ -424,6 +329,7 @@ def save_payment(
                 datetime.now(MSK).isoformat(),
             ),
         )
+
         conn.commit()
         conn.close()
 
@@ -447,7 +353,6 @@ async def send_typing(update: Update, action: str = ChatAction.TYPING) -> None:
 
 
 def extract_image_b64(response) -> Optional[str]:
-    # Вариант 1: response.data[0].b64_json
     data = getattr(response, "data", None)
     if data and len(data) > 0:
         item = data[0]
@@ -455,7 +360,6 @@ def extract_image_b64(response) -> Optional[str]:
         if b64_json:
             return b64_json
 
-    # Вариант 2: response.output[0].content[0].image_base64
     output = getattr(response, "output", None)
     if output:
         try:
@@ -531,7 +435,10 @@ async def post_init(application: Application) -> None:
             BotCommand("help", "Помощь"),
         ]
     )
-    logger.info("Команды бота установлены")# --------------------------------
+    logger.info("Команды бота установлены")
+
+
+# --------------------------------
 # UI
 # --------------------------------
 async def send_topup_menu(update: Update, balance: int) -> None:
@@ -539,10 +446,7 @@ async def send_topup_menu(update: Update, balance: int) -> None:
         f"На вашем балансе сейчас {balance} генераций.\n\n"
         "Выберите пакет ниже 👇"
     )
-    await update.message.reply_text(
-        text,
-        reply_markup=build_buy_keyboard(),
-    )
+    await update.message.reply_text(text, reply_markup=build_buy_keyboard())
 
 
 # --------------------------------
@@ -555,8 +459,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     balance = get_balance(user_id)
     daily_left = get_daily_text_left(user_id)
 
-    text = (
-        "Привет!\n\n"
+    text = ("Привет!\n\n"
         "Я умею:\n"
         "- отвечать на текстовые вопросы\n"
         "- генерировать изображения\n\n"
@@ -588,7 +491,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Сейчас на балансе: {balance} генераций.\n"
         f"Осталось текстовых запросов сегодня: {daily_left}/{DAILY_TEXT_LIMIT}\n\n"
         "Пример для картинки:\n"
-        '"Сгенерируй джунгли реалистично"'
+        "\"Сгенерируй джунгли реалистично\""
     )
     await update.message.reply_text(text)
 
@@ -656,7 +559,8 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer(ok=True)
 
 
-async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:payment = update.message.successful_payment
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    payment = update.message.successful_payment
     user_id = update.effective_user.id
     payload = payment.invoice_payload
     charge_id = payment.telegram_payment_charge_id
@@ -677,8 +581,7 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
         )
         return
 
-    package = IMAGE_PACKAGES.get(payload)
-    gens_to_add = package["gens"] if package else 0
+    package = IMAGE_PACKAGES.get(payload)gens_to_add = package["gens"] if package else 0
 
     save_payment(charge_id, user_id, payload, payment.total_amount)
 
@@ -721,7 +624,6 @@ async def handle_image_request(update: Update, user_text: str) -> None:
         with open(temp_path, "rb") as photo:
             await update.message.reply_photo(photo=photo)
 
-        # Списываем только после успешной отправки фото
         ok = consume_generation(user_id)
         if not ok:
             await update.message.reply_text(
@@ -789,11 +691,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not user_text:
         return
 
-    logger.info(
-        "Message from user_id=%s text=%s",
-        user_id,
-        user_text[:200],
-    )
+    logger.info("Message from user_id=%s text=%s", user_id, user_text[:200])
 
     if is_topup_text_request(user_text):
         balance = get_balance(user_id)
@@ -814,8 +712,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # --------------------------------
 # MAIN
 # --------------------------------
-def main() -> None:
-    logger.info("Building Telegram application")
+def main() -> None:logger.info("Building Telegram application")
 
     init_db()
 
