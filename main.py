@@ -38,7 +38,7 @@ AITUNNEL_BASE_URL = os.getenv("AITUNNEL_BASE_URL", "https://api.aitunnel.ru/v1")
 
 TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", TEXT_MODEL).strip()
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1").strip()
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1-mini").strip()
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "12000"))
