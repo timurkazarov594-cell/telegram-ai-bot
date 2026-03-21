@@ -2,79 +2,67 @@ import asyncio
 import base64
 import logging
 import os
-import sqlite3
-import tempfile
-import threading
-from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from typing import Optional
 
 import httpx
 from openai import OpenAI
-from telegram import (
-    BotCommand,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LabeledPrice,
-    Update,
-)
+from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    PreCheckoutQueryHandler,
     filters,
 )
 
-# --------------------------------
-# ЛОГИ
-# --------------------------------
+# =========================================================
+# LOGGING
+# =========================================================
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("telegram-ai-bot")
 
-# --------------------------------
-# ENV
-# --------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-AITUNNEL_API_KEY = os.getenv("AITUNNEL_API_KEY")
-AITUNNEL_BASE_URL = os.getenv("AITUNNEL_BASE_URL", "https://api.aitunnel.ru/v1")
+# =========================================================
+# ENV / SETTINGS
+# =========================================================
 
-TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1-mini")
-IMAGE_QUALITY = os.getenv("IMAGE_QUALITY", "low")
-IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+AITUNNEL_API_KEY = os.getenv("AITUNNEL_API_KEY", "").strip()
+AITUNNEL_BASE_URL = os.getenv("AITUNNEL_BASE_URL", "https://api.aitunnel.ru/v1").strip()
+
+TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini").strip()
+VISION_MODEL = os.getenv("VISION_MODEL", TEXT_MODEL).strip()
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1").strip()
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
-
-# Для Render лучше использовать Persistent Disk:
-# DB_PATH=/var/data/bot.db
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "12000"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN missing")
+    raise RuntimeError("BOT_TOKEN is missing")
 
 if not AITUNNEL_API_KEY:
-    raise RuntimeError("AITUNNEL_API_KEY missing")
+    raise RuntimeError("AITUNNEL_API_KEY is missing")
 
-# --------------------------------
-# НАСТРОЙКИ
-# --------------------------------
-DAILY_TEXT_LIMIT = 20
-MSK = timezone(timedelta(hours=3))
+http_client = httpx.Client(timeout=httpx.Timeout(REQUEST_TIMEOUT))
 
-IMAGE_PACKAGES = {
-    "buy_4": {"title": "4 генерации", "price": 150, "gens": 4},
-    "buy_10": {"title": "10 генераций", "price": 399, "gens": 10},
-    "buy_25": {"title": "25 генераций", "price": 800, "gens": 25},
-}
+client = OpenAI(
+    api_key=AITUNNEL_API_KEY,
+    base_url=AITUNNEL_BASE_URL,
+    http_client=http_client,
+)
+
+# =========================================================
+# PROMPTS / TRIGGERS
+# =========================================================
 
 IMAGE_TRIGGERS = [
-    "сгенерируй изображение",
+    "сгенерируй",
     "создай картинку",
     "создай изображение",
     "нарисуй",
@@ -86,350 +74,65 @@ IMAGE_TRIGGERS = [
     "make image",
 ]
 
-TOPUP_TEXT_TRIGGERS = [
-    "пополнить",
-    "купить",
-    "купить генерации",
-    "тариф",
-    "тарифы",
+EDIT_IMAGE_TRIGGERS = [
+    "измени фото",
+    "измени изображение",
+    "отредактируй фото",
+    "отредактируй изображение",
+    "редактируй фото",
+    "редактируй изображение",
+    "замени фон",
+    "сделай фон",
+    "убери фон",
+    "добавь на фото",
+    "добавь к фото",
+    "edit image",
+    "edit photo",
 ]
 
-# --------------------------------
-# OPENAI CLIENT
-# --------------------------------
-client = OpenAI(
-    api_key=AITUNNEL_API_KEY,
-    base_url=AITUNNEL_BASE_URL,
-    http_client=httpx.Client(timeout=httpx.Timeout(REQUEST_TIMEOUT)),
+SYSTEM_PROMPT = (
+    "Ты полезный Telegram-бот. "
+    "Отвечай кратко, ясно и по делу. "
+    "Если пользователь прислал изображение без явного запроса на редактирование, "
+    "опиши, что на нём видно, и дай полезный краткий анализ."
 )
 
-# --------------------------------
-# SQLITE
-# --------------------------------
-db_lock = threading.Lock()
+VISION_PROMPT = (
+    "Опиши изображение кратко и точно на русском языке. "
+    "Если это товарное фото, выдели: что за предмет, стиль, цвета, материалы, "
+    "фон, качество фото и возможные улучшения для карточки товара."
+)
+
+IMAGE_GEN_STYLE_PROMPT = (
+    "Сделай результат очень качественным, как премиальная рекламная съёмка. "
+    "Высокая детализация, реалистичный свет, хорошая композиция, "
+    "дорогой визуальный стиль, без текста и водяных знаков."
+)
+
+# =========================================================
+# HELPERS
+# =========================================================
 
-
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def today_msk_str() -> str:
-    return datetime.now(MSK).strftime("%Y-%m-%d")
-
-
-def init_db() -> None:
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS users ("
-            "user_id INTEGER PRIMARY KEY, "
-            "paid_generations INTEGER NOT NULL DEFAULT 0, "
-            "free_generations INTEGER NOT NULL DEFAULT 1, "
-            "daily_text_count INTEGER NOT NULL DEFAULT 0, "
-            "last_reset TEXT NOT NULL)"
-        )
-
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS payments ("
-            "telegram_payment_charge_id TEXT PRIMARY KEY, "
-            "user_id INTEGER NOT NULL, "
-            "payload TEXT NOT NULL, "
-            "total_amount INTEGER NOT NULL, "
-            "created_at TEXT NOT NULL)"
-        )
-
-        conn.commit()
-
-        # Миграция старой базы, если колонка free_generations отсутствует
-        try:
-            cur.execute("SELECT free_generations FROM users LIMIT 1")
-        except sqlite3.OperationalError:
-            cur.execute(
-                "ALTER TABLE users ADD COLUMN free_generations INTEGER NOT NULL DEFAULT 1"
-            )
-            conn.commit()
-
-        conn.close()
-
-    logger.info("Database initialized at %s", DB_PATH)
-
-
-def ensure_user(user_id: int) -> None:
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-
-        if row is None:
-            cur.execute(
-                "INSERT INTO users (user_id, paid_generations, free_generations, daily_text_count, last_reset) "
-                "VALUES (?, 0, 1, 0, ?)",
-                (user_id, today_msk_str()),
-            )
-            conn.commit()
-        else:
-            # Подстраховка для старых записей
-            try:
-                cur.execute(
-                    "UPDATE users SET free_generations = COALESCE(free_generations, 1) WHERE user_id = ?",
-                    (user_id,),
-                )
-                conn.commit()
-            except sqlite3.OperationalError:
-                pass
-
-        conn.close()
-
-
-def reset_daily_if_needed(user_id: int) -> None:
-    ensure_user(user_id)
-
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("SELECT last_reset FROM users WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-
-        today = today_msk_str()
-        if row and row["last_reset"] != today:
-            cur.execute(
-                "UPDATE users SET daily_text_count = 0, last_reset = ? WHERE user_id = ?",
-                (today, user_id),
-            )
-            conn.commit()
-
-        conn.close()
-
-
-def get_balance(user_id: int) -> int:
-    ensure_user(user_id)
-
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT paid_generations, free_generations FROM users WHERE user_id = ?",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-
-    paid = int(row["paid_generations"]) if row else 0
-    free = int(row["free_generations"]) if row else 0
-    balance = paid + free
-
-    logger.info(
-        "get_balance user_id=%s paid=%s free=%s total=%s",
-        user_id,
-        paid,
-        free,
-        balance,
-    )
-    return balance
-
-
-def get_balance_parts(user_id: int) -> tuple[int, int]:
-    ensure_user(user_id)
-
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT paid_generations, free_generations FROM users WHERE user_id = ?",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-
-    paid = int(row["paid_generations"]) if row else 0
-    free = int(row["free_generations"]) if row else 0
-    return paid, free
-
-
-def add_generations(user_id: int, amount: int) -> int:
-    ensure_user(user_id)
-
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute(
-            "UPDATE users SET paid_generations = paid_generations + ? WHERE user_id = ?",
-            (amount, user_id),
-        )
-        conn.commit()
-
-        cur.execute(
-            "SELECT paid_generations, free_generations FROM users WHERE user_id = ?",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-
-    paid = int(row["paid_generations"]) if row else 0
-    free = int(row["free_generations"]) if row else 0
-    total = paid + free
-
-    logger.info(
-        "add_generations user_id=%s amount=%s paid=%s free=%s total=%s",
-        user_id,
-        amount,
-        paid,
-        free,
-        total,
-    )
-    return total
-
-
-def consume_generation(user_id: int) -> bool:
-    ensure_user(user_id)
-
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("BEGIN IMMEDIATE")
-        cur.execute(
-            "SELECT paid_generations, free_generations FROM users WHERE user_id = ?",
-            (user_id,),
-        )
-        row = cur.fetchone()
-
-        paid = int(row["paid_generations"]) if row else 0
-        free = int(row["free_generations"]) if row else 0
-
-        logger.info(
-            "consume_generation user_id=%s paid=%s free=%s",
-            user_id,
-            paid,
-            free,
-        )
-
-        if free > 0:
-            cur.execute(
-                "UPDATE users SET free_generations = free_generations - 1 WHERE user_id = ?",
-                (user_id,),
-            )
-            conn.commit()
-            conn.close()
-            return True
-
-        if paid > 0:
-            cur.execute(
-                "UPDATE users SET paid_generations = paid_generations - 1 WHERE user_id = ?",
-                (user_id,),
-            )
-            conn.commit()
-            conn.close()
-            return True
-
-        conn.rollback()
-        conn.close()
-        return False
-
-
-def get_daily_text_left(user_id: int) -> int:
-    reset_daily_if_needed(user_id)
-
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT daily_text_count FROM users WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-        conn.close()
-
-    used = int(row["daily_text_count"]) if row else 0
-    return max(0, DAILY_TEXT_LIMIT - used)
-
-
-def can_send_text(user_id: int) -> bool:
-    return get_daily_text_left(user_id) > 0
-
-
-def increment_text_count(user_id: int) -> None:
-    reset_daily_if_needed(user_id)
-
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute(
-            "UPDATE users SET daily_text_count = daily_text_count + 1 WHERE user_id = ?",
-            (user_id,),
-        )
-
-        conn.commit()
-        conn.close()
-
-
-def payment_already_processed(telegram_payment_charge_id: str) -> bool:
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute(
-            "SELECT telegram_payment_charge_id FROM payments WHERE telegram_payment_charge_id = ?",
-            (telegram_payment_charge_id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-
-    return row is not None
-
-
-def save_payment(
-    telegram_payment_charge_id: str,
-    user_id: int,
-    payload: str,
-    total_amount: int,
-) -> None:
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute(
-            "INSERT OR IGNORE INTO payments "
-            "(telegram_payment_charge_id, user_id, payload, total_amount, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                telegram_payment_charge_id,
-                user_id,
-                payload,
-                total_amount,
-                datetime.now(MSK).isoformat(),
-            ),
-        )
-
-        conn.commit()
-        conn.close()
-
-
-# --------------------------------
-# ВСПОМОГАТЕЛЬНОЕ
-# --------------------------------
 def is_image_request(text: str) -> bool:
     text = text.lower().strip()
     return any(trigger in text for trigger in IMAGE_TRIGGERS)
 
-
-def is_topup_text_request(text: str) -> bool:
+def is_image_edit_request(text: str) -> bool:
     text = text.lower().strip()
-    return text in TOPUP_TEXT_TRIGGERS
+    return any(trigger in text for trigger in EDIT_IMAGE_TRIGGERS)
 
+def trim_text(text: str, max_chars: int = MAX_TEXT_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
 
-async def send_typing(update: Update, action: str = ChatAction.TYPING) -> None:
-    if update.effective_chat:
-        await update.effective_chat.send_action(action=action)
+def split_long_message(text: str, chunk_size: int = 4000) -> list[str]:
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)] or [""]
 
-
-def extract_image_b64(response) -> Optional[str]:
+def extract_image_b64_from_images_response(response) -> Optional[str]:
+    """
+    Пытаемся достать base64-картинку из разных совместимых ответов API.
+    """
     data = getattr(response, "data", None)
     if data and len(data) > 0:
         item = data[0]
@@ -447,34 +150,48 @@ def extract_image_b64(response) -> Optional[str]:
                     if image_base64:
                         return image_base64
         except Exception:
-            logger.exception("Ошибка при разборе изображения из API")
+            pass
 
     return None
 
+async def send_typing(update: Update, action: str = ChatAction.TYPING) -> None:
+    if update.effective_chat:
+        await update.effective_chat.send_action(action=action)
 
-def build_buy_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("150 ⭐ — 4 генерации", callback_data="buy_4")],
-            [InlineKeyboardButton("399 ⭐ — 10 генераций", callback_data="buy_10")],
-            [InlineKeyboardButton("800 ⭐ — 25 генераций", callback_data="buy_25")],
-        ]
-    )
+async def get_telegram_image_bytes(update: Update) -> Optional[bytes]:
+    if not update.message:
+        return None
 
+    tg_file = None
 
-# --------------------------------
-# OPENAI ВЫЗОВЫ
-# --------------------------------
+    if update.message.photo:
+        tg_file = await update.message.photo[-1].get_file()
+    elif update.message.document and update.message.document.mime_type:
+        if update.message.document.mime_type.startswith("image/"):
+            tg_file = await update.message.document.get_file()
+
+    if tg_file is None:
+        return None
+
+    bio = BytesIO()
+    await tg_file.download_to_memory(out=bio)
+    return bio.getvalue()
+
+# =========================================================
+# OPENAI / AITUNNEL CALLS
+# =========================================================
+
 def generate_text_blocking(user_text: str) -> str:
+    """
+    Через chat.completions для лучшей совместимости с прокси/OpenAI-compatible API.
+    """
     response = client.chat.completions.create(
         model=TEXT_MODEL,
         messages=[
-            {
-                "role": "system",
-                "content": "Ты полезный Telegram-бот. Отвечай кратко, ясно и по делу.",
-            },
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_text},
         ],
+        temperature=0.7,
     )
 
     answer = response.choices[0].message.content
@@ -482,359 +199,244 @@ def generate_text_blocking(user_text: str) -> str:
         return "Не удалось получить ответ."
     return answer.strip()
 
+def analyze_image_blocking(image_bytes: bytes, caption_text: str = "") -> str:
+    """
+    Распознавание изображения через chat.completions с image_url.
+    Это обычно лучше совместимо с OpenAI-compatible proxy.
+    """
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    prompt = VISION_PROMPT
+    if caption_text:
+        prompt += f"\n\nДополнительный запрос пользователя: {caption_text}"
+
+    response = client.chat.completions.create(
+        model=VISION_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{image_b64}"
+                        },
+                    },
+                ],
+            },
+        ],
+        temperature=0.3,
+    )
+
+    answer = response.choices[0].message.content
+    if not answer:
+        return "Не удалось распознать изображение."
+    return answer.strip()
 
 def generate_image_blocking(prompt: str) -> bytes:
     response = client.images.generate(
         model=IMAGE_MODEL,
-        prompt=prompt,
-        size=IMAGE_SIZE,
-        quality=IMAGE_QUALITY,
+        prompt=f"{prompt}\n\n{IMAGE_GEN_STYLE_PROMPT}",
+        size="1024x1024",
+        quality="high",
+        output_format="png",
     )
 
-    image_b64 = extract_image_b64(response)
+    image_b64 = extract_image_b64_from_images_response(response)
     if not image_b64:
-        raise RuntimeError("API не вернул изображение")
-
+        raise RuntimeError("API не вернул изображение в base64")
     return base64.b64decode(image_b64)
 
-
-# --------------------------------
-# КОМАНДЫ МЕНЮ
-# --------------------------------
-async def post_init(application: Application) -> None:
-    init_db()
-
-    await application.bot.set_my_commands(
-        [
-            BotCommand("start", "Запуск бота"),
-            BotCommand("popolnit", "Купить генерации"),
-            BotCommand("balance", "Мой баланс"),
-            BotCommand("limit", "Лимит на сегодня"),
-            BotCommand("help", "Помощь"),
-        ]
+def edit_image_blocking(image_bytes: bytes, prompt: str) -> bytes:
+    """
+    Если у AITunnel images.edit совместим с OpenAI SDK, это будет работать.
+    Если их прокси не поддерживает edit endpoint, бот вернёт понятную ошибку.
+    """
+    response = client.images.edit(
+        model=IMAGE_MODEL,
+        image=("input.png", image_bytes, "image/png"),
+        prompt=f"{prompt}\n\n{IMAGE_GEN_STYLE_PROMPT}",
+        size="1024x1024",
+        quality="high",
+        output_format="png",
     )
-    logger.info("Команды бота установлены")
 
+    image_b64 = extract_image_b64_from_images_response(response)
+    if not image_b64:
+        raise RuntimeError("API не вернул отредактированное изображение")
+    return base64.b64decode(image_b64)
 
-# --------------------------------
-# UI
-# --------------------------------
-async def send_topup_menu(update: Update, balance: int) -> None:
-    text = (
-        f"На вашем балансе сейчас {balance} генераций.\n\n"
-        "Выберите пакет ниже 👇"
-    )
-    await update.message.reply_text(text, reply_markup=build_buy_keyboard())
+# =========================================================
+# COMMANDS
+# =========================================================
 
-
-# --------------------------------
-# КОМАНДЫ
-# --------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    ensure_user(user_id)
-
-    balance = get_balance(user_id)
-    daily_left = get_daily_text_left(user_id)
-
     text = (
-        "Привет!\n\n"
-        "Я умею:\n"
-        "- отвечать на текстовые вопросы\n"
-        "- генерировать изображения\n\n"
-        "🎁 У каждого есть 1 бесплатная генерация.\n"
-        "После оплаты генерации начисляются на баланс.\n"
-        "Списание происходит только после успешной отправки картинки.\n\n"
-        f"Сейчас у вас: {balance} генераций.\n"
-        f"Осталось текстовых запросов сегодня: {daily_left}/{DAILY_TEXT_LIMIT}\n\n"
-        "Команды:\n"
-        "/popolnit — купить генерации\n"
-        "/balance — показать баланс\n"
-        "/limit — показать лимит на сегодня\n"
-        "/help — помощь"
+        "Привет. Я AI-бот.\n\n"
+        "Что умею:\n"
+        "— отвечать на текстовые вопросы\n"
+        "— распознавать присланные изображения\n"
+        "— генерировать картинки по описанию\n"
+        "— редактировать присланные фото по инструкции\n\n"
+        "Примеры:\n"
+        "— Сгенерируй картинку премиального флакона духов на мраморе\n"
+        "— Пришли фото товара и подпиши: замени фон на люкс-студию\n"
+        "— Просто пришли фото без подписи, и я его опишу"
     )
     await update.message.reply_text(text)
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    balance = get_balance(user_id)
-    daily_left = get_daily_text_left(user_id)
-
     text = (
         "Команды:\n"
         "/start — запуск\n"
-        "/help — помощь\n"
-        "/balance — показать баланс генераций\n"
-        "/limit — показать лимит на сегодня\n"
-        "/popolnit — купить генерации\n\n"
-        "🎁 У каждого есть 1 бесплатная генерация.\n"
-        f"Сейчас на балансе: {balance} генераций.\n"
-        f"Осталось текстовых запросов сегодня: {daily_left}/{DAILY_TEXT_LIMIT}\n\n"
-        "Пример для картинки:\n"
-        "\"Сгенерируй джунгли реалистично\""
+        "/help — помощь\n\n"
+        "Сценарии:\n"
+        "1) Текст → отвечаю текстом\n"
+        "2) Текст с запросом на картинку → генерирую изображение\n"
+        "3) Фото без запроса → распознаю и описываю\n"
+        "4) Фото + инструкция → редактирую фото"
     )
     await update.message.reply_text(text)
 
+# =========================================================
+# HANDLERS
+# =========================================================
 
-async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    total = get_balance(user_id)
-    paid, free = get_balance_parts(user_id)
-
-    await update.message.reply_text(
-        f"На вашем балансе {total} генераций.\n"
-        f"Платных: {paid}\n"
-        f"Бесплатных: {free}"
-    )
-
-
-async def limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    daily_left = get_daily_text_left(user_id)
-    await update.message.reply_text(
-        "Лимит текстовых запросов обновляется каждый день по МСК.\n"
-        f"Сегодня осталось: {daily_left}/{DAILY_TEXT_LIMIT}."
-    )
-
-
-async def popolnit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    balance = get_balance(update.effective_user.id)
-    await send_topup_menu(update, balance)
-
-
-# --------------------------------
-# ОПЛАТА
-# --------------------------------
-async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    package = IMAGE_PACKAGES.get(query.data)
-    if not package:
-        await query.message.reply_text("Неизвестный пакет.")
-        return
-
-    logger.info(
-        "Invoice requested: user_id=%s payload=%s price=%s",
-        query.from_user.id,
-        query.data,
-        package["price"],
-    )
-
-    await context.bot.send_invoice(
-        chat_id=query.message.chat_id,
-        title=package["title"],
-        description=f"Покупка {package['gens']} генераций изображений",
-        payload=query.data,
-        provider_token="",
-        currency="XTR",
-        prices=[LabeledPrice(package["title"], package["price"])],
-    )
-
-
-async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.pre_checkout_query
-
-    logger.info(
-        "PreCheckout received: user_id=%s payload=%s total_amount=%s currency=%s",
-        query.from_user.id,
-        query.invoice_payload,
-        query.total_amount,
-        query.currency,
-    )
-
-    await query.answer(ok=True)
-
-
-async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    payment = update.message.successful_payment
-    user_id = update.effective_user.id
-    payload = payment.invoice_payload
-    charge_id = payment.telegram_payment_charge_id
-
-    logger.info(
-        "Successful payment: user_id=%s payload=%s total_amount=%s currency=%s charge_id=%s",
-        user_id,
-        payload,
-        payment.total_amount,
-        payment.currency,
-        charge_id,
-    )
-
-    if payment_already_processed(charge_id):
-        balance = get_balance(user_id)
-        await update.message.reply_text(
-            f"Платеж уже был обработан ранее. На вашем балансе {balance} генераций."
-        )
-        return
-
-    package = IMAGE_PACKAGES.get(payload)
-    gens_to_add = package["gens"] if package else 0
-
-    save_payment(charge_id, user_id, payload, payment.total_amount)
-
-    if gens_to_add > 0:
-        new_balance = add_generations(user_id, gens_to_add)
-    else:
-        new_balance = get_balance(user_id)
-
-    await update.message.reply_text(
-        f"Платеж успешно получен! На вашем балансе {new_balance} генераций."
-    )
-
-
-# --------------------------------
-# ОБРАБОТКА ЗАПРОСОВ
-# --------------------------------
 async def handle_image_request(update: Update, user_text: str) -> None:
-    user_id = update.effective_user.id
-    ensure_user(user_id)
-
-    balance_before = get_balance(user_id)
-    logger.info(
-        "handle_image_request user_id=%s balance_before=%s",
-        user_id,
-        balance_before,
-    )
-
-    if balance_before <= 0:
-        await update.message.reply_text(
-            "У вас нет доступных генераций.\nИспользуйте /popolnit."
-        )
-        return
-
     await send_typing(update, ChatAction.UPLOAD_PHOTO)
 
-    temp_path = None
     try:
         image_bytes = await asyncio.to_thread(generate_image_blocking, user_text)
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as f:
-            f.write(image_bytes)
-            temp_path = f.name
-
-        with open(temp_path, "rb") as photo:
-            await update.message.reply_photo(photo=photo)
-
-        ok = consume_generation(user_id)
-        if not ok:
-            await update.message.reply_text(
-                "Картинка отправлена, но не удалось корректно списать генерацию. Проверьте /balance."
-            )
-            return
-
-        total_after = get_balance(user_id)
-        paid_after, free_after = get_balance_parts(user_id)
-
-        await update.message.reply_text(
-            f"Готово. Остаток на балансе: {total_after} генераций.\n"
-            f"Платных: {paid_after}\n"
-            f"Бесплатных: {free_after}"
-        )
-
+        await update.message.reply_photo(photo=image_bytes)
     except Exception as e:
         logger.exception("Image generation failed: %s", e)
         await update.message.reply_text(
-            "Не удалось сгенерировать изображение. Генерация не была списана."
+            f"Не удалось сгенерировать изображение.\n\nОшибка: {e}"
         )
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                logger.exception("Не удалось удалить временный файл")
-
 
 async def handle_text_request(update: Update, user_text: str) -> None:
-    user_id = update.effective_user.id
-    ensure_user(user_id)
-
-    if not can_send_text(user_id):
-        await update.message.reply_text(
-            "Лимит текстовых запросов на сегодня исчерпан.\n"
-            "Попробуйте завтра после 00:00 по МСК."
-        )
-        return
-
     await send_typing(update, ChatAction.TYPING)
 
     try:
         answer = await asyncio.to_thread(generate_text_blocking, user_text)
-        increment_text_count(user_id)
-
-        max_len = 4000
-        for i in range(0, len(answer), max_len):
-            await update.message.reply_text(answer[i:i + max_len])
-
-        left = get_daily_text_left(user_id)
-        await update.message.reply_text(
-            f"Осталось текстовых запросов сегодня: {left}/{DAILY_TEXT_LIMIT}."
-        )
-
+        for chunk in split_long_message(trim_text(answer), 4000):
+            await update.message.reply_text(chunk)
     except Exception as e:
         logger.exception("Text generation failed: %s", e)
-        await update.message.reply_text("Не удалось получить ответ.")
+        await update.message.reply_text(
+            f"Не удалось получить ответ.\n\nОшибка: {e}"
+        )
 
+async def handle_photo_analysis(update: Update, caption_text: str = "") -> None:
+    await send_typing(update, ChatAction.TYPING)
+
+    try:
+        image_bytes = await get_telegram_image_bytes(update)
+        if not image_bytes:
+            await update.message.reply_text("Не удалось скачать изображение.")
+            return
+
+        answer = await asyncio.to_thread(analyze_image_blocking, image_bytes, caption_text)
+        for chunk in split_long_message(trim_text(answer), 4000):
+            await update.message.reply_text(chunk)
+    except Exception as e:
+        logger.exception("Image analysis failed: %s", e)
+        await update.message.reply_text(
+            f"Не удалось распознать изображение.\n\nОшибка: {e}"
+        )
+
+async def handle_photo_edit(update: Update, edit_prompt: str) -> None:
+    await send_typing(update, ChatAction.UPLOAD_PHOTO)
+
+    try:
+        image_bytes = await get_telegram_image_bytes(update)
+        if not image_bytes:
+            await update.message.reply_text("Не удалось скачать изображение.")
+            return
+
+        result_bytes = await asyncio.to_thread(edit_image_blocking, image_bytes, edit_prompt)
+        await update.message.reply_photo(photo=result_bytes)
+    except Exception as e:
+        logger.exception("Image edit failed: %s", e)
+        await update.message.reply_text(
+            f"Не удалось отредактировать изображение.\n\nОшибка: {e}"
+        )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
+    if not update.message:
         return
 
-    user_id = update.effective_user.id
-    ensure_user(user_id)
+    has_image = bool(update.message.photo) or (
+        update.message.document
+        and update.message.document.mime_type
+        and update.message.document.mime_type.startswith("image/")
+    )
+
+    if has_image:
+        caption = (update.message.caption or "").strip()
+        logger.info(
+            "Image message from user_id=%s caption=%s",
+            update.effective_user.id if update.effective_user else "unknown",
+            caption[:200],
+        )
+
+        if caption and is_image_edit_request(caption):
+            await handle_photo_edit(update, caption)
+        else:
+            await handle_photo_analysis(update, caption)
+        return
+
+    if not update.message.text:
+        return
 
     user_text = update.message.text.strip()
     if not user_text:
+        await update.message.reply_text("Отправь текстовый запрос.")
         return
 
-    logger.info("Message from user_id=%s text=%s", user_id, user_text[:200])
-
-    if is_topup_text_request(user_text):
-        balance = get_balance(user_id)
-        await send_topup_menu(update, balance)
-        return
+    logger.info(
+        "Text message from user_id=%s text=%s",
+        update.effective_user.id if update.effective_user else "unknown",
+        user_text[:200],
+    )
 
     if is_image_request(user_text):
         await handle_image_request(update, user_text)
-        return
-
-    await handle_text_request(update, user_text)
-
+    else:
+        await handle_text_request(update, user_text)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled error: %s", context.error)
 
-
-# --------------------------------
+# =========================================================
 # MAIN
-# --------------------------------
+# =========================================================
+
 def main() -> None:
     logger.info("Building Telegram application")
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    init_db()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO | filters.Document.IMAGE | (filters.TEXT & ~filters.COMMAND),
+            handle_message,
+        )
+    )
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("balance", balance_command))
-    app.add_handler(CommandHandler("limit", limit_command))
-    app.add_handler(CommandHandler("popolnit", popolnit_command))
-
-    app.add_handler(CallbackQueryHandler(buy_callback))
-    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    app.add_error_handler(error_handler)
+    application.add_error_handler(error_handler)
 
     logger.info("Bot is starting polling")
-    app.run_polling(
+    application.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
     )
-
 
 if __name__ == "__main__":
     main()
