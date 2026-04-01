@@ -1,867 +1,579 @@
-import asyncio
-import base64
-import json
-import logging
 import os
-import sqlite3
-import tempfile
-import threading
-from typing import Dict, Optional, Tuple
+import html
+import asyncio
+from typing import Dict, Any, List
 
-import httpx
-from openai import OpenAI
-from telegram import (
-    BotCommand,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LabeledPrice,
-    Update,
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
+import uvicorn
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    WebAppInfo,
+    ReplyKeyboardRemove,
 )
-from telegram.constants import ChatAction
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    PreCheckoutQueryHandler,
-    filters,
-)
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 
-# =========================================================
-# ЛОГИ
-# =========================================================
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
 
-# =========================================================
-# ENV
-# =========================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-AITUNNEL_API_KEY = os.getenv("AITUNNEL_API_KEY")
-AITUNNEL_BASE_URL = os.getenv("AITUNNEL_BASE_URL", "https://api.aitunnel.ru/v1")
+# =========================
+# CONFIG
+# =========================
+load_dotenv()
 
-TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")
-VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1-mini")
-
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
-DB_PATH = os.getenv("DB_PATH", "interior_simple_bot.db")
+BOT_TOKEN = os.getenv("BOT_TOKEN").strip()
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-if not AITUNNEL_API_KEY:
-    raise RuntimeError("AITUNNEL_API_KEY is missing")
-
-http_client = httpx.Client(timeout=httpx.Timeout(REQUEST_TIMEOUT))
-client = OpenAI(
-    api_key=AITUNNEL_API_KEY,
-    base_url=AITUNNEL_BASE_URL,
-    http_client=http_client,
-)
-
-# =========================================================
-# ТАРИФЫ
-# =========================================================
-FREE_RENDER_LIMIT = 2
-
-PACK_4_PRICE_STARS = 300
-PACK_4_CREDITS = 4
-
-PACK_10_PRICE_STARS = 600
-PACK_10_CREDITS = 10
-
-PAYLOAD_PACK_4 = "stars_pack_4_renders"
-PAYLOAD_PACK_10 = "stars_pack_10_renders"
-
-# =========================================================
-# ОПРОС
-# =========================================================
-QUESTIONS = [
-    ("style", "Какой стиль интерьера нужен?\nПримеры: минимализм, современный, лофт, джапанди, неоклассика."),
-    ("room_type", "Какое помещение?\nПримеры: кухня, спальня, гостиная, детская, офис, студия."),
-    ("colors", "Какие цвета нравятся?\nПримеры: бежевый, серый, белый, дерево, оливковый."),
-    ("furniture", "Какая мебель или зоны обязательно нужны?\nПример: большой диван, рабочее место, остров, шкаф до потолка."),
-    ("budget", "Какой бюджет?\nПример: до 300 000 ₽ / средний / премиум."),
-    ("extra", "Дополнительные пожелания?\nПример: больше света, много хранения, уютно, без темных цветов."),
-]
-
-QUESTION_KEYS = [q[0] for q in QUESTIONS]
-
-STATUS_IDLE = "idle"
-STATUS_ASKING = "asking"
-STATUS_WAITING_PHOTO = "waiting_photo"
-STATUS_RENDERING = "rendering"
-
-# =========================================================
-# SQLITE
-# =========================================================
-db_lock = threading.Lock()
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-conn.row_factory = sqlite3.Row
+    raise RuntimeError("В .env не найден BOT_TOKEN")
 
 
-def init_db() -> None:
-    with db_lock:
-        cur = conn.cursor()
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                free_renders_used INTEGER NOT NULL DEFAULT 0,
-                paid_renders_balance INTEGER NOT NULL DEFAULT 0,
-                current_index INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'idle',
-                photo_analysis TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_answers (
-                user_id INTEGER NOT NULL,
-                answer_key TEXT NOT NULL,
-                answer_value TEXT,
-                PRIMARY KEY (user_id, answer_key)
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                invoice_payload TEXT NOT NULL,
-                stars_amount INTEGER NOT NULL,
-                credits_added INTEGER NOT NULL,
-                telegram_payment_charge_id TEXT,
-                provider_payment_charge_id TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-
-        conn.commit()
+# =========================
+# STORAGE
+# =========================
+# Для простоты храним в памяти.
+# Для продакшена лучше Redis/PostgreSQL.
+USER_PROJECTS: Dict[int, Dict[str, Any]] = {}
 
 
-def ensure_user_exists(user_id: int) -> None:
-    with db_lock:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-            (user_id,),
-        )
-        conn.commit()
+# =========================
+# FSM STATES
+# =========================
+class DesignForm(StatesGroup):
+    property_type = State()
+    area = State()
+    rooms = State()
+    style = State()
+    fireplace = State()
+    furniture = State()
+    second_floor = State()
+    terrace = State()
+    residents = State()
+    budget = State()
+    done = State()
 
 
-def get_user(user_id: int) -> sqlite3.Row:
-    ensure_user_exists(user_id)
-    with db_lock:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        return cur.fetchone()
+# =========================
+# INIT BOT
+# =========================
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+app = FastAPI(title="Telegram Home Design Mini App")
 
 
-def get_answers(user_id: int) -> Dict[str, str]:
-    ensure_user_exists(user_id)
-    with db_lock:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT answer_key, answer_value FROM user_answers WHERE user_id = ?",
-            (user_id,),
-        )
-        rows = cur.fetchall()
-    return {r["answer_key"]: (r["answer_value"] or "") for r in rows}
-
-
-def set_user_fields(
-    user_id: int,
-    *,
-    free_renders_used: Optional[int] = None,
-    paid_renders_balance: Optional[int] = None,
-    current_index: Optional[int] = None,
-    status: Optional[str] = None,
-    photo_analysis: Optional[str] = None,
-    reset_photo_analysis: bool = False,
-) -> None:
-    ensure_user_exists(user_id)
-
-    fields = []
-    values = []
-
-    if free_renders_used is not None:
-        fields.append("free_renders_used = ?")
-        values.append(free_renders_used)
-
-    if paid_renders_balance is not None:
-        fields.append("paid_renders_balance = ?")
-        values.append(paid_renders_balance)
-
-    if current_index is not None:
-        fields.append("current_index = ?")
-        values.append(current_index)
-
-    if status is not None:
-        fields.append("status = ?")
-        values.append(status)
-
-    if reset_photo_analysis:
-        fields.append("photo_analysis = NULL")
-    elif photo_analysis is not None:
-        fields.append("photo_analysis = ?")
-        values.append(photo_analysis)
-
-    if not fields:
-        return
-
-    fields.append("updated_at = CURRENT_TIMESTAMP")
-    values.append(user_id)
-
-    with db_lock:
-        cur = conn.cursor()
-        cur.execute(
-            f"UPDATE users SET {', '.join(fields)} WHERE user_id = ?",
-            values,
-        )
-        conn.commit()
-
-
-def save_answer(user_id: int, key: str, value: str) -> None:
-    ensure_user_exists(user_id)
-    with db_lock:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO user_answers (user_id, answer_key, answer_value)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id, answer_key)
-            DO UPDATE SET answer_value = excluded.answer_value
-            """,
-            (user_id, key, value),
-        )
-        cur.execute(
-            "UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
-            (user_id,),
-        )
-        conn.commit()
-
-
-def clear_brief(user_id: int) -> None:
-    ensure_user_exists(user_id)
-    with db_lock:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM user_answers WHERE user_id = ?", (user_id,))
-        cur.execute(
-            """
-            UPDATE users
-            SET current_index = 0,
-                status = ?,
-                photo_analysis = NULL,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE user_id = ?
-            """,
-            (STATUS_ASKING, user_id),
-        )
-        conn.commit()
-
-
-def add_paid_credits(user_id: int, amount: int) -> None:
-    ensure_user_exists(user_id)
-    with db_lock:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE users
-            SET paid_renders_balance = paid_renders_balance + ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE user_id = ?
-            """,
-            (amount, user_id),
-        )
-        conn.commit()
-
-
-def register_payment(
-    user_id: int,
-    invoice_payload: str,
-    stars_amount: int,
-    credits_added: int,
-    telegram_payment_charge_id: Optional[str],
-    provider_payment_charge_id: Optional[str],
-) -> None:
-    with db_lock:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO payments (
-                user_id,
-                invoice_payload,
-                stars_amount,
-                credits_added,
-                telegram_payment_charge_id,
-                provider_payment_charge_id
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                invoice_payload,
-                stars_amount,
-                credits_added,
-                telegram_payment_charge_id,
-                provider_payment_charge_id,
-            ),
-        )
-        conn.commit()
-
-
-def get_free_left(user: sqlite3.Row) -> int:
-    return max(0, FREE_RENDER_LIMIT - user["free_renders_used"])
-
-
-def get_total_left(user: sqlite3.Row) -> int:
-    return get_free_left(user) + user["paid_renders_balance"]
-
-
-def can_render(user: sqlite3.Row) -> bool:
-    return get_total_left(user) > 0
-
-
-def consume_one_render(user_id: int) -> Tuple[str, int, int]:
-    with db_lock:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT free_renders_used, paid_renders_balance FROM users WHERE user_id = ?",
-            (user_id,),
-        )
-        row = cur.fetchone()
-
-        free_used = row["free_renders_used"]
-        paid_balance = row["paid_renders_balance"]
-        free_left = max(0, FREE_RENDER_LIMIT - free_used)
-
-        if free_left > 0:
-            free_used += 1
-            cur.execute(
-                """
-                UPDATE users
-                SET free_renders_used = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE user_id = ?
-                """,
-                (free_used, user_id),
-            )
-            conn.commit()
-            return "free", max(0, FREE_RENDER_LIMIT - free_used), paid_balance
-
-        if paid_balance > 0:
-            paid_balance -= 1
-            cur.execute(
-                """
-                UPDATE users
-                SET paid_renders_balance = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE user_id = ?
-                """,
-                (paid_balance, user_id),
-            )
-            conn.commit()
-            return "paid", free_left, paid_balance
-
-        raise RuntimeError("No render credits left")
-
-
-# =========================================================
-# ВСПОМОГАТЕЛЬНОЕ
-# =========================================================
-async def send_typing(update: Update, action: str = ChatAction.TYPING) -> None:
-    if update.effective_chat:
-        await update.effective_chat.send_action(action=action)
-
-
-def encode_file_to_data_url(file_path: str, mime_type: str = "image/jpeg") -> str:
-    with open(file_path, "rb") as f:
-        encoded = base64.b64encode(f.read()).decode("utf-8")
-    return f"data:{mime_type};base64,{encoded}"
-
-
-def extract_image_b64(response) -> Optional[str]:
-    data = getattr(response, "data", None)
-    if data and len(data) > 0:
-        item = data[0]
-        b64_json = getattr(item, "b64_json", None)
-        if b64_json:
-            return b64_json
-
-    output = getattr(response, "output", None)
-    if output:
-        try:
-            for out_item in output:
-                content = getattr(out_item, "content", None) or []
-                for c in content:
-                    image_base64 = getattr(c, "image_base64", None)
-                    if image_base64:
-                        return image_base64
-        except Exception:
-            pass
-
-    return None
-
-
-def balance_text(user: sqlite3.Row) -> str:
-    return (
-        f"Баланс:\n"
-        f"— Бесплатных генераций осталось: {get_free_left(user)}\n"
-        f"— Платных генераций осталось: {user['paid_renders_balance']}\n"
-        f"— Всего доступно: {get_total_left(user)}"
+# =========================
+# HELPERS
+# =========================
+def yes_no_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Да"), KeyboardButton(text="Нет")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
     )
 
 
-def build_prompt(answers: Dict[str, str], photo_analysis: str) -> str:
-    return f"""
-You are a professional interior designer and prompt engineer.
-
-Create one strong English prompt for an interior render.
-
-Client brief:
-- Style: {answers.get("style", "not specified")}
-- Room type: {answers.get("room_type", "not specified")}
-- Preferred colors: {answers.get("colors", "not specified")}
-- Required furniture/zones: {answers.get("furniture", "not specified")}
-- Budget: {answers.get("budget", "not specified")}
-- Extra wishes: {answers.get("extra", "not specified")}
-
-Photo analysis:
-{photo_analysis}
-
-Requirements:
-- realistic premium interior render
-- cohesive composition
-- interior design level quality
-- visually rich but not overloaded
-- correct lighting
-- detailed materials
-- furniture appropriate to style
-- based on the real room proportions from the photo if possible
-
-Return only one final English image generation prompt, without comments or headings.
-""".strip()
-
-
-# =========================================================
-# OPENAI
-# =========================================================
-def analyze_image_blocking(image_path: str) -> str:
-    image_data_url = encode_file_to_data_url(image_path)
-
-    response = client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты дизайнер интерьера. "
-                    "Кратко и полезно проанализируй фото помещения. "
-                    "Определи пространство, планировку, стиль, свет, материалы, проблемы помещения "
-                    "и что важно учесть для будущей визуализации."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Проанализируй это помещение как интерьерный дизайнер."},
-                    {"type": "image_url", "image_url": {"url": image_data_url}},
-                ],
-            },
-        ],
+def property_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Дом"), KeyboardButton(text="Квартира")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
     )
 
-    answer = response.choices[0].message.content
-    return answer.strip() if answer else "Не удалось проанализировать фото."
 
-
-def generate_render_prompt_blocking(answers: Dict[str, str], photo_analysis: str) -> str:
-    response = client.chat.completions.create(
-        model=TEXT_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты профессиональный интерьерный prompt engineer. "
-                    "Возвращай только один сильный prompt на английском для генерации изображения."
-                ),
-            },
-            {
-                "role": "user",
-                "content": build_prompt(answers, photo_analysis),
-            },
-        ],
-    )
-
-    answer = response.choices[0].message.content
-    if not answer:
-        raise RuntimeError("Не удалось собрать prompt")
-    return answer.strip()
-
-
-def generate_image_blocking(prompt: str) -> bytes:
-    response = client.images.generate(
-        model=IMAGE_MODEL,
-        prompt=prompt,
-        size="1024x1024",
-    )
-
-    image_b64 = extract_image_b64(response)
-    if not image_b64:
-        raise RuntimeError("Не удалось получить изображение из ответа API")
-
-    return base64.b64decode(image_b64)
-
-
-# =========================================================
-# МЕНЮ
-# =========================================================
-async def setup_bot_commands(application: Application) -> None:
-    commands = [
-        BotCommand("start", "Начать новый подбор интерьера"),
-        BotCommand("balance", "Посмотреть баланс"),
-        BotCommand("topup", "Пополнить баланс"),
-    ]
-    await application.bot.set_my_commands(commands)
-
-
-# =========================================================
-# STARS
-# =========================================================
-def topup_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
+def menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Создать дизайн")],
             [
-                InlineKeyboardButton("300 ⭐ = 4 генерации", callback_data="buy_pack_4"),
-            ],
-            [
-                InlineKeyboardButton("600 ⭐ = 10 генераций", callback_data="buy_pack_10"),
-            ],
-        ]
-    )
-
-
-async def send_stars_invoice(
-    update: Update,
-    title: str,
-    description: str,
-    payload: str,
-    stars_amount: int,
-    label: str,
-) -> None:
-    target = update.effective_message
-    await target.reply_invoice(
-        title=title,
-        description=description,
-        payload=payload,
-        provider_token="",
-        currency="XTR",
-        prices=[LabeledPrice(label, stars_amount)],
-    )
-
-
-async def topup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = get_user(update.effective_user.id)
-    await update.message.reply_text(
-        "Выбери пакет пополнения:",
-        reply_markup=topup_keyboard(),
-    )
-    await update.message.reply_text(balance_text(user))
-
-
-async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "buy_pack_4":
-        await send_stars_invoice(
-            update,
-            "Пакет 4 генерации",
-            "4 дополнительных генерации интерьера",
-            PAYLOAD_PACK_4,
-            PACK_4_PRICE_STARS,
-            "4 генерации",
-        )
-    elif query.data == "buy_pack_10":
-        await send_stars_invoice(
-            update,
-            "Пакет 10 генераций",
-            "10 дополнительных генераций интерьера",
-            PAYLOAD_PACK_10,
-            PACK_10_PRICE_STARS,
-            "10 генераций",
-        )
-
-
-async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.pre_checkout_query
-    if query.invoice_payload not in {PAYLOAD_PACK_4, PAYLOAD_PACK_10}:
-        await query.answer(ok=False, error_message="Неизвестный пакет оплаты.")
-        return
-    await query.answer(ok=True)
-
-
-async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    payment = update.message.successful_payment
-    user_id = update.effective_user.id
-
-    if payment.invoice_payload == PAYLOAD_PACK_4:
-        credits = PACK_4_CREDITS
-        stars = PACK_4_PRICE_STARS
-    elif payment.invoice_payload == PAYLOAD_PACK_10:
-        credits = PACK_10_CREDITS
-        stars = PACK_10_PRICE_STARS
-    else:
-        await update.message.reply_text("Платеж получен, но пакет не распознан.")
-        return
-
-    add_paid_credits(user_id, credits)
-    register_payment(
-        user_id=user_id,
-        invoice_payload=payment.invoice_payload,
-        stars_amount=stars,
-        credits_added=credits,
-        telegram_payment_charge_id=getattr(payment, "telegram_payment_charge_id", None),
-        provider_payment_charge_id=getattr(payment, "provider_payment_charge_id", None),
-    )
-
-    user = get_user(user_id)
-    await update.message.reply_text(
-        f"Оплата прошла успешно ✅\n\nНачислено: {credits} генераций\n\n{balance_text(user)}"
-    )
-
-
-# =========================================================
-# КОМАНДЫ
-# =========================================================
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    clear_brief(user_id)
-
-    await update.message.reply_text(
-        "Привет. Я помогу собрать интерьерный бриф и в конце сгенерирую интерьер по фото.\n\n"
-        "Отвечай по очереди на вопросы.\n\n"
-        f"Вопрос 1/{len(QUESTIONS)}:\n{QUESTIONS[0][1]}"
-    )
-
-
-async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = get_user(update.effective_user.id)
-    await update.message.reply_text(balance_text(user))
-
-
-# =========================================================
-# ОПРОС
-# =========================================================
-async def handle_question_answer(update: Update, user: sqlite3.Row, text: str) -> bool:
-    user_id = update.effective_user.id
-
-    if user["status"] != STATUS_ASKING:
-        return False
-
-    current_index = user["current_index"]
-
-    if current_index < 0 or current_index >= len(QUESTIONS):
-        return False
-
-    key, _ = QUESTIONS[current_index]
-    save_answer(user_id, key, text)
-
-    next_index = current_index + 1
-
-    if next_index >= len(QUESTIONS):
-        set_user_fields(user_id, current_index=len(QUESTIONS), status=STATUS_WAITING_PHOTO)
-        await update.message.reply_text(
-            "Отлично. Теперь отправь фото помещения.\n\n"
-            "После фото я:\n"
-            "— проанализирую пространство\n"
-            "— соберу prompt по твоим ответам\n"
-            "— сгенерирую интерьер"
-        )
-        return True
-
-    set_user_fields(user_id, current_index=next_index, status=STATUS_ASKING)
-    await update.message.reply_text(f"Вопрос {next_index + 1}/{len(QUESTIONS)}:\n{QUESTIONS[next_index][1]}")
-    return True
-
-
-# =========================================================
-# РЕНДЕР ПО ФОТО
-# =========================================================
-async def handle_photo_and_render(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    user = get_user(user_id)
-
-    if user["status"] != STATUS_WAITING_PHOTO:
-        await update.message.reply_text(
-            "Сейчас фото не ожидается.\n\nНажми /start, чтобы начать новый подбор."
-        )
-        return
-
-    if not can_render(user):
-        await update.message.reply_text(
-            "У тебя закончились генерации.\n\n"
-            "Пополнить баланс: /topup\n"
-            f"{balance_text(user)}"
-        )
-        return
-
-    if not update.message.photo:
-        await update.message.reply_text("Не вижу фото.")
-        return
-
-    set_user_fields(user_id, status=STATUS_RENDERING)
-    await send_typing(update, ChatAction.UPLOAD_PHOTO)
-
-    photo = update.message.photo[-1]
-    tg_file = await photo.get_file()
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-        temp_path = tmp.name
-
-    await tg_file.download_to_drive(temp_path)
-
-    try:
-        await update.message.reply_text("Анализирую фото помещения...")
-        photo_analysis = await asyncio.to_thread(analyze_image_blocking, temp_path)
-        set_user_fields(user_id, photo_analysis=photo_analysis)
-
-        answers = get_answers(user_id)
-
-        await update.message.reply_text("Собираю интерьерный prompt...")
-        render_prompt = await asyncio.to_thread(
-            generate_render_prompt_blocking,
-            answers,
-            photo_analysis,
-        )
-
-        await update.message.reply_text("Генерирую интерьер...")
-        image_bytes = await asyncio.to_thread(generate_image_blocking, render_prompt)
-
-        source, free_left_after, paid_left_after = consume_one_render(user_id)
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as out:
-            out.write(image_bytes)
-            out_path = out.name
-
-        try:
-            with open(out_path, "rb") as img:
-                used_text = "Списана бесплатная генерация." if source == "free" else "Списана платная генерация."
-                await update.message.reply_photo(
-                    photo=img,
-                    caption=(
-                        "Готово ✅\n\n"
-                        f"{used_text}\n"
-                        f"Бесплатных осталось: {free_left_after}\n"
-                        f"Платных осталось: {paid_left_after}\n\n"
-                        "Чтобы сделать новый вариант, нажми /start"
-                    ),
+                KeyboardButton(
+                    text="Открыть Mini App",
+                    web_app=WebAppInfo(url=f"{PUBLIC_BASE_URL}/app/{user_id}")
                 )
-        finally:
-            if os.path.exists(out_path):
-                os.remove(out_path)
+            ],
+        ],
+        resize_keyboard=True,
+    )
 
-        set_user_fields(user_id, status=STATUS_IDLE, current_index=0)
 
-    except Exception as e:
-        logger.exception("Render flow failed: %s", e)
-        set_user_fields(user_id, status=STATUS_WAITING_PHOTO)
-        await update.message.reply_text(
-            "Не удалось сгенерировать интерьер.\n"
-            "Попробуй отправить фото еще раз."
+def normalize_yes_no(text: str) -> str:
+    text = text.strip().lower()
+    if text == "да":
+        return "Да"
+    if text == "нет":
+        return "Нет"
+    return text
+
+
+def is_yes_no(text: str) -> bool:
+    return text.strip().lower() in {"да", "нет"}
+
+
+def safe(value: Any) -> str:
+    return html.escape(str(value))
+
+
+def placeholder_images(data: Dict[str, Any]) -> List[str]:
+    style = data.get("style", "modern")
+    property_type = data.get("property_type", "home")
+    prompt = f"{property_type} {style}".replace(" ", "+")
+    return [
+        f"https://placehold.co/900x600?text={prompt}+Exterior",
+        f"https://placehold.co/900x600?text={prompt}+Living+Room",
+        f"https://placehold.co/900x600?text={prompt}+Kitchen+Bedroom",
+    ]
+
+
+def build_design_concept(data: Dict[str, Any]) -> Dict[str, Any]:
+    property_type = data["property_type"]
+    area = data["area"]
+    rooms = data["rooms"]
+    style = data["style"]
+    fireplace = data["fireplace"]
+    furniture = data["furniture"]
+    second_floor = data["second_floor"]
+    terrace = data["terrace"]
+    residents = data["residents"]
+    budget = data["budget"]
+
+    title = f"{property_type.capitalize()} — {style}, {area}"
+
+    summary = (
+        f"Проект: {property_type}, площадь {area}, помещения: {rooms}. "
+        f"Стиль: {style}. Камин: {fireplace}. Мебель: {furniture}. "
+        f"Второй этаж: {second_floor}. Терраса/балкон: {terrace}. "
+        f"Для кого: {residents}. Бюджет: {budget}."
+    )
+
+    recommendations: List[str] = []
+
+    style_lower = style.lower()
+
+    if "миним" in style_lower:
+        recommendations.append("Основа интерьера — чистые линии, спокойные формы и минимум визуального шума.")
+        recommendations.append("Подойдут светлые стены, тёплое дерево, встроенные системы хранения и мягкий рассеянный свет.")
+    elif "лофт" in style_lower:
+        recommendations.append("Основной акцент — фактуры бетона, металла, стекла и более графичная мебель.")
+        recommendations.append("Хорошо будут смотреться тёмные акценты, трековый свет и открытые композиции.")
+    elif "сканди" in style_lower:
+        recommendations.append("Лучший подход — светлая база, натуральные материалы, уютный текстиль и простая эргономика.")
+        recommendations.append("Интерьер стоит делать тёплым и функциональным, без перегруза деталями.")
+    elif "неокласс" in style_lower:
+        recommendations.append("Подойдут симметрия, благородные оттенки, мягкие фактуры и аккуратные декоративные акценты.")
+        recommendations.append("Важно сохранить баланс между элегантностью и современным удобством.")
+    else:
+        recommendations.append("Оптимальный путь — современный удобный интерьер с акцентом на комфорт и визуальную цельность.")
+        recommendations.append("Лучше связать все зоны единым набором материалов, света и мебели.")
+
+    if fireplace == "Да":
+        recommendations.append("Камин можно сделать главным композиционным центром гостиной или общей зоны.")
+    else:
+        recommendations.append("Без камина стоит усилить атмосферу через декоративный свет, текстиль и акцентную стену.")
+
+    if furniture == "Да":
+        recommendations.append("Поскольку мебель предусмотрена сразу, интерьер стоит проектировать как готовую цельную сцену.")
+    else:
+        recommendations.append("Так как мебель не обязательна сразу, можно заложить более гибкую базу для постепенного наполнения.")
+
+    if second_floor == "Да":
+        recommendations.append("Если есть второй этаж, лестницу лучше сделать выразительным архитектурным элементом проекта.")
+    else:
+        recommendations.append("При одном уровне стоит уделить больше внимания зонированию и логике проходов.")
+
+    if terrace == "Да":
+        recommendations.append("Террасу или балкон хорошо связать с интерьером едиными материалами и общей атмосферой.")
+    else:
+        recommendations.append("Если внешней зоны нет, акцент можно перенести на более светлый и просторный интерьер внутри.")
+
+    concept_text = (
+        f"Этот проект предполагает создание {style.lower()} дизайна для объекта типа «{property_type}» "
+        f"площадью {area}. Пространство должно ощущаться удобным для категории жильцов: {residents}. "
+        f"Планировочное решение ориентируется на формат помещений «{rooms}», а визуальный язык строится "
+        f"вокруг материалов и решений, которые соответствуют заявленному бюджету: {budget}. "
+        f"Главная цель — сделать интерьер не просто красивым, а цельным, логичным и визуально убедительным."
+    )
+
+    visual_prompt = (
+        f"High-quality realistic interior and exterior design concept for a {property_type}, "
+        f"area {area}, rooms: {rooms}, style: {style}, fireplace: {fireplace}, "
+        f"furnished: {furniture}, second floor: {second_floor}, terrace or balcony: {terrace}, "
+        f"for residents: {residents}, budget level: {budget}. Architectural visualization, elegant, realistic lighting."
+    )
+
+    return {
+        "title": title,
+        "summary": summary,
+        "concept_text": concept_text,
+        "recommendations": recommendations,
+        "visual_prompt": visual_prompt,
+        "images": placeholder_images(data),
+    }
+
+
+def get_project(user_id: int) -> Dict[str, Any] | None:
+    return USER_PROJECTS.get(user_id)
+
+
+def save_project(user_id: int, answers: Dict[str, Any]) -> Dict[str, Any]:
+    result = build_design_concept(answers)
+    project = {
+        "user_id": user_id,
+        "answers": answers,
+        "result": result,
+    }
+    USER_PROJECTS[user_id] = project
+    return project
+
+
+# =========================
+# BOT FLOW
+# =========================
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text = (
+        "Привет. Я бот для создания дизайн-концепта дома или квартиры.\n\n"
+        "Я буду задавать вопросы по одному, а потом соберу результат и открою его в Mini App внутри Telegram.\n\n"
+        "Нажми «Создать дизайн»."
+    )
+    await message.answer(text, reply_markup=menu_keyboard(message.from_user.id))
+
+
+@dp.message(F.text == "Создать дизайн")
+async def start_design(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(DesignForm.property_type)
+    await message.answer(
+        "Что нужно спроектировать?",
+        reply_markup=property_keyboard()
+    )
+
+
+@dp.message(DesignForm.property_type)
+async def process_property_type(message: Message, state: FSMContext) -> None:
+    text = message.text.strip().lower()
+    if text not in {"дом", "квартира"}:
+        await message.answer("Пожалуйста, выбери: Дом или Квартира.", reply_markup=property_keyboard())
+        return
+
+    await state.update_data(property_type=message.text.strip().capitalize())
+    await state.set_state(DesignForm.area)
+    await message.answer("Какая площадь объекта?", reply_markup=ReplyKeyboardRemove())
+
+
+@dp.message(DesignForm.area)
+async def process_area(message: Message, state: FSMContext) -> None:
+    value = message.text.strip()
+    await state.update_data(area=value)
+    await state.set_state(DesignForm.rooms)
+    await message.answer("Сколько комнат или какое распределение помещений нужно? Например: 2 комнаты / 3 спальни + кухня-гостиная")
+
+
+@dp.message(DesignForm.rooms)
+async def process_rooms(message: Message, state: FSMContext) -> None:
+    await state.update_data(rooms=message.text.strip())
+    await state.set_state(DesignForm.style)
+    await message.answer("Какой стиль нравится? Например: минимализм, современный, лофт, скандинавский, неоклассика")
+
+
+@dp.message(DesignForm.style)
+async def process_style(message: Message, state: FSMContext) -> None:
+    await state.update_data(style=message.text.strip())
+    await state.set_state(DesignForm.fireplace)
+    await message.answer("Нужен ли камин?", reply_markup=yes_no_keyboard())
+
+
+@dp.message(DesignForm.fireplace)
+async def process_fireplace(message: Message, state: FSMContext) -> None:
+    if not is_yes_no(message.text):
+        await message.answer("Ответь, пожалуйста: Да или Нет.", reply_markup=yes_no_keyboard())
+        return
+
+    await state.update_data(fireplace=normalize_yes_no(message.text))
+    await state.set_state(DesignForm.furniture)
+    await message.answer("Нужно ли сразу учитывать мебель в дизайне?", reply_markup=yes_no_keyboard())
+
+
+@dp.message(DesignForm.furniture)
+async def process_furniture(message: Message, state: FSMContext) -> None:
+    if not is_yes_no(message.text):
+        await message.answer("Ответь, пожалуйста: Да или Нет.", reply_markup=yes_no_keyboard())
+        return
+
+    await state.update_data(furniture=normalize_yes_no(message.text))
+    await state.set_state(DesignForm.second_floor)
+    await message.answer("Нужен ли второй этаж?", reply_markup=yes_no_keyboard())
+
+
+@dp.message(DesignForm.second_floor)
+async def process_second_floor(message: Message, state: FSMContext) -> None:
+    if not is_yes_no(message.text):
+        await message.answer("Ответь, пожалуйста: Да или Нет.", reply_markup=yes_no_keyboard())
+        return
+
+    await state.update_data(second_floor=normalize_yes_no(message.text))
+    await state.set_state(DesignForm.terrace)
+    await message.answer("Нужна ли терраса или балкон?", reply_markup=yes_no_keyboard())
+
+
+@dp.message(DesignForm.terrace)
+async def process_terrace(message: Message, state: FSMContext) -> None:
+    if not is_yes_no(message.text):
+        await message.answer("Ответь, пожалуйста: Да или Нет.", reply_markup=yes_no_keyboard())
+        return
+
+    await state.update_data(terrace=normalize_yes_no(message.text))
+    await state.set_state(DesignForm.residents)
+    await message.answer("Для кого это жильё? Например: один человек, пара, семья с детьми")
+
+
+@dp.message(DesignForm.residents)
+async def process_residents(message: Message, state: FSMContext) -> None:
+    await state.update_data(residents=message.text.strip())
+    await state.set_state(DesignForm.budget)
+    await message.answer("Какой бюджет или уровень бюджета? Например: низкий / средний / высокий / премиум")
+
+
+@dp.message(DesignForm.budget)
+async def process_budget(message: Message, state: FSMContext) -> None:
+    await state.update_data(budget=message.text.strip())
+    data = await state.get_data()
+
+    project = save_project(message.from_user.id, data)
+    await state.set_state(DesignForm.done)
+
+    result = project["result"]
+    text = (
+        "Готово. Я собрал дизайн-концепт.\n\n"
+        f"Название проекта: {result['title']}\n\n"
+        "Теперь нажми кнопку ниже, чтобы открыть результат в Mini App."
+    )
+
+    await message.answer(
+        text,
+        reply_markup=menu_keyboard(message.from_user.id)
+    )
+
+
+@dp.message(F.text == "Открыть Mini App")
+async def open_app_hint(message: Message) -> None:
+    await message.answer(
+        "Нажми именно на кнопку «Открыть Mini App» в клавиатуре ниже.",
+        reply_markup=menu_keyboard(message.from_user.id)
+    )
+
+
+# =========================
+# FASTAPI ROUTES
+# =========================
+@app.get("/", response_class=HTMLResponse)
+async def root() -> str:
+    return """
+   
+     
+     
+       
+Telegram Home Design Mini App
+
+       
+Откройте приложение через Telegram-бота.
+
+     
+   
+    """
+
+
+@app.get("/api/project/{user_id}", response_class=JSONResponse)
+async def api_project(user_id: int):
+    project = get_project(user_id)
+    if not project:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Проект не найден. Сначала пройдите опрос в боте."
+            },
+            status_code=404
         )
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+
+    return {
+        "ok": True,
+        "project": project
+    }
 
 
-# =========================================================
-# ОБЫЧНЫЕ ТЕКСТЫ
-# =========================================================
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
+@app.get("/app/{user_id}", response_class=HTMLResponse)
+async def mini_app(user_id: int) -> str:
+    project = get_project(user_id)
 
-    user_id = update.effective_user.id
-    user = get_user(user_id)
-    text = update.message.text.strip()
+    if not project:
+        return f"""
+       
+         
+           
+           
+           
+           
+         
+         
+           
+             
+Проект не найден
 
-    if not text:
-        await update.message.reply_text("Сообщение пустое.")
-        return
+             
+Сначала пройдите опрос в боте, потом снова откройте Mini App.
 
-    handled = await handle_question_answer(update, user, text)
-    if handled:
-        return
+           
+         
+       
+        """
 
-    if user["status"] == STATUS_WAITING_PHOTO:
-        await update.message.reply_text("Теперь нужно отправить фото помещения.")
-        return
+    answers = project["answers"]
+    result = project["result"]
 
-    if user["status"] == STATUS_RENDERING:
-        await update.message.reply_text("Сейчас идет генерация, подожди немного.")
-        return
-
-    await update.message.reply_text(
-        "Нажми /start, чтобы начать подбор интерьера.\n"
-        "Баланс: /balance\n"
-        "Пополнение: /topup"
+    recommendations_html = "".join(
+        f"
+{safe(item)}
+" for item in result["recommendations"]
     )
 
-
-# =========================================================
-# ОШИБКИ
-# =========================================================
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled error: %s", context.error)
-
-
-# =========================================================
-# ЗАПУСК
-# =========================================================
-def main() -> None:
-    init_db()
-    logger.info("Building Telegram application")
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(setup_bot_commands)
-        .build()
+    images_html = "".join(
+        f"""
+       
+            design image
+       
+        """
+        for url in result["images"]
     )
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("balance", balance_command))
-    application.add_handler(CommandHandler("topup", topup_command))
+    answers_html = f"""
+   
+     
+Тип: {safe(answers["property_type"])}
+     
+Площадь: {safe(answers["area"])}
+     
+Комнаты: {safe(answers["rooms"])}
+     
+Стиль: {safe(answers["style"])}
+     
+Камин: {safe(answers["fireplace"])}
+     
+Мебель: {safe(answers["furniture"])}
+     
+Второй этаж: {safe(answers["second_floor"])}
+     
+Терраса/балкон: {safe(answers["terrace"])}
+     
+Для кого: {safe(answers["residents"])}
+     
+Бюджет: {safe(answers["budget"])}
+   
+    """
 
-    application.add_handler(CallbackQueryHandler(buy_callback, pattern="^buy_pack_"))
-    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+    return f"""
+   
+   
+   
+     
+     
+     
+     
+     
+   
+   
+     
+       
+         
+{safe(result["title"])}
+         
+{safe(result["summary"])}
 
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo_and_render))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+         
+            Показать сообщение в Telegram
+            Обновить
+         
+       
 
-    application.add_error_handler(error_handler)
+       
+         
+Параметры проекта
 
-    logger.info("Bot is starting polling")
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
+          {answers_html}
+       
+
+       
+         
+Дизайн-концепция
+
+         
+{safe(result["concept_text"])}
+       
+
+       
+         
+Рекомендации
+
+         
+            {recommendations_html}
+         
+       
+
+       
+         
+Изображения проекта
+
+         
+            {images_html}
+         
+       
+
+       
+         
+AI prompt для дальнейшей генерации
+
+         
+{safe(result["visual_prompt"])}
+       
+
+       
+          Mini App открыт внутри Telegram. Позже сюда можно подключить реальную AI-генерацию картинок и 3D.
+       
+     
+
+     
+   
+   
+    """
+
+
+# =========================
+# RUNNERS
+# =========================
+async def run_bot() -> None:
+    await dp.start_polling(bot)
+
+
+async def run_web() -> None:
+    config = uvicorn.Config(
+        app=app,
+        host="0.0.0.0",
+        port=8080,
+        log_level="info",
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+async def main() -> None:
+    await asyncio.gather(
+        run_web(),
+        run_bot(),
     )
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
