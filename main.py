@@ -84,7 +84,7 @@ async def finish(message: Message, state: FSMContext):
 """
 
     # 👇 ВАЖНО: вставишь сюда Render URL позже
-    url = "https://ТВОЙ-РЕНДЕР.onrender.com"
+    url = "https://https://telegram-ai-bot-cwqi.onrender.com.onrender.com"
 
     await message.answer(text)
     await message.answer("Открыть дизайн:", reply_markup=webapp_kb(url))
