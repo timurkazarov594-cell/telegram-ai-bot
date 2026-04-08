@@ -21,7 +21,7 @@ from aiogram.types import (
 # НАСТРОЙКИ
 # =========================
 BOT_TOKEN = "8328109350:AAErabgJ8T3p2xwe7d4BUka40A_NMAPevAw"
-MANAGER_CHAT_ID = 123456789  # <-- сюда вставь chat_id менеджера после /myid
+MANAGER_CHAT_ID = 7135951470  # <-- сюда вставь chat_id менеджера после /myid
 DB_PATH = "manicure_bot.db"
 MSK_TZ = ZoneInfo("Europe/Moscow")
 SALON_ADDRESS = "Москва,Электролитный проезд 1б"
