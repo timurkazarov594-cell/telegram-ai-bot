@@ -1,2 +1,2 @@
-Python-telegram-bot
-Openai
+aiogram
+aiosqlite
